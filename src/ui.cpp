@@ -3,6 +3,7 @@
 #include "mem.h"
 #include "log.h"
 #include <cstdarg>
+#include <cmath>
 #include <cstdlib>
 
 namespace fsd {
@@ -289,7 +290,7 @@ namespace fsd {
         (void)id;
         return changed;
     }
-    bool Ui::InputBox(int id, int x, int y, int w, int h, std::wstring& buf, bool numeric) {
+    bool Ui::InputBox(int id, int x, int y, int w, int h, std::wstring& buf, bool numeric, bool dec1) {
         bool focused = (activeInput == id);
         // 上一个输入框按了 Tab：焦点跳到这里（内容全选，直接打字替换）
         if (pendingFocus == id) {
@@ -356,9 +357,25 @@ namespace fsd {
             for (size_t i = 0; i < qchars.size();) {
                 wchar_t ch = qchars[i];
                 if (ctrl) { qchars.erase(qchars.begin() + i); continue; }    // Ctrl+字母不当成输入
-                bool ok = numeric ? ((ch >= L'0' && ch <= L'9') || ch == L'.' || ch == L'-' || ch == L'+' ||
-                                     (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F') || ch == L'x' || ch == L'X')
-                                  : (ch >= 32);
+                bool ok;
+                if (dec1) {
+                    // 数值框：只允许 0~9 和一个小数点，小数点后最多一位（不能输负号）
+                    ok = (ch >= L'0' && ch <= L'9') || ch == L'.';
+                    if (ok) {
+                        std::wstring tmp = inSelAll ? std::wstring() : buf;
+                        size_t pos = inSelAll ? 0 : (inCursor < (int)tmp.size() ? (size_t)inCursor : tmp.size());
+                        tmp.insert(tmp.begin() + pos, ch);
+                        int dots = 0;
+                        for (wchar_t c2 : tmp) if (c2 == L'.') ++dots;
+                        if (dots > 1) ok = false;
+                        size_t d = tmp.find(L'.');
+                        if (d != std::wstring::npos && tmp.size() - d - 1 > 1) ok = false;
+                    }
+                } else {
+                    ok = numeric ? ((ch >= L'0' && ch <= L'9') || ch == L'.' || ch == L'-' || ch == L'+' ||
+                                    (ch >= L'a' && ch <= L'f') || (ch >= L'A' && ch <= L'F') || ch == L'x' || ch == L'X')
+                                 : (ch >= 32);
+                }
                 if (ok) {
                     if (inSelAll) { buf.clear(); inCursor = 0; inSelAll = false; }
                     if (inCursor > (int)buf.size()) inCursor = (int)buf.size();
@@ -471,12 +488,13 @@ namespace fsd {
             bool editing = (activeInput == 2000 + (int)i);
             bool ready = (f.kind == "cheat") || f.addr != 0;
             // 正在编辑时不要用旧值回填（否则清空输入框会"回弹"）
-            if (valBuf[i].empty() && !editing) { wchar_t b[32]; swprintf_s(b, L"%.2f", f.cur); valBuf[i] = b; }
+            if (valBuf[i].empty() && !editing) { wchar_t b[32]; swprintf_s(b, L"%.1f", f.cur); valBuf[i] = b; }
             // 输入框左侧的 － / ＋ 按钮：只改数值，不立刻下发
             {
                 auto nudge = [&](double d) {
                     double v = _wtof(valBuf[i].c_str()) + d;
-                    wchar_t b[32]; swprintf_s(b, L"%.2f", v);
+                    if (v < 0) v = 0;                       // 一律不允许负值
+                    wchar_t b[32]; swprintf_s(b, L"%.1f", v);
                     valBuf[i] = b;
                     inSelAll = false; inCursor = (int)valBuf[i].size();
                     note = L"已改数值，按「应用」或回车才生效";
@@ -487,20 +505,20 @@ namespace fsd {
             bool entered = false;
             if (f.ui == "slider") {
                 double vv = f.cur;
-                wchar_t bb[32]; swprintf_s(bb, L"%.2f", vv); valBuf[i] = bb;
+                wchar_t bb[32]; swprintf_s(bb, L"%.1f", vv); valBuf[i] = bb;
                 bool moved = Slider(2000 + (int)i, x + S(310), dcy, S(150), LineH() + S(10), vv, f.lo, f.hi);
-                bool typed = InputBox(3000 + (int)i, x + S(470), dcy, S(80), LineH() + S(10), valBuf[i], true);
+                bool typed = InputBox(3000 + (int)i, x + S(470), dcy, S(80), LineH() + S(10), valBuf[i], true, true);
                 if ((moved || typed) && (f.kind == "cheat" || f.addr)) {
                     double use = moved ? vv : _wtof(valBuf[i].c_str());
                     g_features.SetValue(i, use);
-                    if (moved) { wchar_t b2[32]; swprintf_s(b2, L"%.2f", vv); valBuf[i] = b2; }
+                    if (moved) { wchar_t b2[32]; swprintf_s(b2, L"%.1f", vv); valBuf[i] = b2; }
                     note = L"已应用";
                 }
             } else {
-                entered = InputBox(2000 + (int)i, x + S(310), dcy, S(100), LineH() + S(10), valBuf[i], true);
+                entered = InputBox(2000 + (int)i, x + S(310), dcy, S(100), LineH() + S(10), valBuf[i], true, true);
             }
             if (entered) {
-                if (f.kind == "cheat" || f.addr) { g_features.SetValue(i, _wtof(valBuf[i].c_str())); note = L"已应用（回车）"; }
+                if (f.kind == "cheat" || f.addr) { double v0=_wtof(valBuf[i].c_str()); if (v0<0) v0=0; wchar_t b0[32]; swprintf_s(b0,L"%.1f",v0); valBuf[i]=b0; g_features.SetValue(i, v0); note = L"已应用（回车）"; }
                 else if (selected >= 0 && sc->Count() > 0) bindIdx = i;
                 else note = L"先在「扫描」页选中一个数值，再点「绑定」";
             }
@@ -518,7 +536,7 @@ namespace fsd {
             }
             if (Button(x + S(420), dcy, S(110), LineH() + S(10), ready ? L"应用" : L"绑定", false, true)) {
                 if (!ready) { if (selected >= 0 && sc->Count() > 0) bindIdx = i; else note = L"先在「扫描」页选中一个数值，再点「绑定」"; }
-                else { g_features.SetValue(i, _wtof(valBuf[i].c_str())); note = L"已应用"; }
+                else { double v0=_wtof(valBuf[i].c_str()); if (v0<0) v0=0; wchar_t b0[32]; swprintf_s(b0,L"%.1f",v0); valBuf[i]=b0; g_features.SetValue(i, v0); note = L"已应用"; }
             }
             if (Button(x + S(540), dcy, S(120), LineH() + S(10), L"恢复默认", false, ready && (changed || f.on))) {
                 g_features.ResetValue(i); valBuf[i].clear(); note = L"已恢复默认";
@@ -567,7 +585,8 @@ namespace fsd {
                         Button(bx, by, rowW, LineH() + S(8), label, false, false);
                     } else {
                         bool ready = (f.kind == "cheat") || f.addr != 0;
-                        if (Button(bx, by, rowW, LineH() + S(8), label, f.ui == "toggle" && f.on, true)) {
+                        bool onNow = f.on;                         // 开关型的状态在 f.on 上（Toggle() 翻的就是它；加载时已按 def 初始化）
+                        if (Button(bx, by, rowW, LineH() + S(8), label, f.ui == "toggle" && onNow, true)) {
                             if (!ready) {
                                 if (selected >= 0 && sc->Count() > 0) bindIdx = i;
                                 else note = L"此功能还没有数据：先用「扫描」选中数值，再点这个按钮即可绑定";
@@ -588,6 +607,7 @@ namespace fsd {
             if (rowsn < 1) rowsn = 1;
             dcy += rowsn * gh + S(2);
         };
+        // 开关型（ui=toggle）单独一块网格：列表里只放数值型，排版才不乱
         drawGrid("toggle", L"开关", L"点一下开 / 再点一下关（关闭时恢复原状）");
         drawGrid("action", L"动作", L"点一下触发一次（立刻执行）");
 
@@ -630,7 +650,7 @@ namespace fsd {
         cy += lh;
 
         Text(x, cy + S(3), L"数值", kColDim);
-        InputBox(1, bx, cy - S(3), S(170), LineH() + S(6), scanValue, true);
+        InputBox(1, bx, cy - S(3), S(170), LineH() + S(6), scanValue, true, true);
         if (Button(bx + S(178), cy - S(3), S(110), LineH() + S(6), L"首次扫描", false, !sc->busy.load())) {
             sc->FirstScan(vtype, _wtof(scanValue.c_str()), scanModuleOnly);
             selected = -1; scroll = 0;
@@ -659,7 +679,7 @@ namespace fsd {
         cy += lh;
 
         Text(x, cy + S(3), L"写入", kColDim);
-        InputBox(2, bx, cy - S(3), S(170), LineH() + S(6), writeValue, true);
+        InputBox(2, bx, cy - S(3), S(170), LineH() + S(6), writeValue, true, true);
         if (Button(bx + S(178), cy - S(3), S(110), LineH() + S(6), L"写入选中", false, selected >= 0)) {
             uintptr_t addr = 0;
             { std::lock_guard<std::mutex> lk(sc->mtx); if (selected >= 0 && selected < (int)sc->hits.size()) addr = sc->hits[selected].addr; }
@@ -962,7 +982,7 @@ namespace fsd {
     bool Ui::EspWanted() {
         for (auto& f : g_features.list) {
             if (f.kind != "cheat") continue;
-            if ((f.key == "esp_enemies" || f.key == "esp_minerals") && f.cur > 0) return true;
+            if ((f.key == "esp_enemies" || f.key == "esp_minerals" || f.key == "esp_team" || f.key == "esp_radar") && f.cur > 0) return true;
         }
         return false;
     }
@@ -983,17 +1003,28 @@ namespace fsd {
         FILE* f = nullptr;
         if (_wfopen_s(&f, file.c_str(), L"rb") != 0 || !f) return;
         std::vector<EspDot> tmp;
-        char line[200];
+        char line[240];
         while (fgets(line, sizeof(line), f)) {
-            if (line[0] != 'E' && line[0] != 'M') continue;
-            float a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
-            int got = sscanf_s(line + 1, "%f %f %f %f %f", &a1, &a2, &a3, &a4, &a5);
+            // E/M = 敌人/矿物（v55 起格式：x1 y1 x2 y2 距离 生命 护甲 名字）
+            // T   = 队友（x1 y1 x2 y2 距离 生命 护甲 倒地 名字）  R = 雷达点（方位角 距离 类型）
+            if (line[0] != 'E' && line[0] != 'M' && line[0] != 'T' && line[0] != 'R') continue;
+            if (line[0] == 'R') {
+                float ang = 0, dist = 0; char kind = 'E';
+                if (sscanf_s(line + 1, "%f %f %c", &ang, &dist, &kind, 1) < 2) continue;
+                EspDot e; e.kind = L'R'; e.x1 = ang; e.y1 = dist; e.d = (kind == 'M' ? 2.f : (kind == 'T' ? 3.f : 1.f));
+                tmp.push_back(e);
+                continue;
+            }
+            float a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = -1, a7 = -1, a8 = 0;
+            int got = sscanf_s(line + 1, "%f %f %f %f %f %f %f %f", &a1, &a2, &a3, &a4, &a5, &a6, &a7, &a8);
             EspDot e; e.kind = (wchar_t)line[0];
             if (got >= 5) {
                 e.x1 = a1; e.y1 = a2; e.x2 = a3; e.y2 = a4; e.d = a5;
-                // 第 6 项起是名字（UTF-8，可能含中文）：跳过前 5 个数字，剩下的整段就是名字
+                int skipN = 5;
+                if (line[0] == 'T') { e.hp = a6; e.sh = a7; e.down = (int)a8; skipN = 8; }
+                else { e.hp = a6; e.sh = a7; skipN = 7; }        // v55：第 6/7 项是生命/护甲
                 const char* np = line + 1;
-                for (int t = 0; t < 5 && *np; ++t) {
+                for (int t = 0; t < skipN && *np; ++t) {
                     while (*np == ' ' || *np == '\t') ++np;
                     while (*np && *np != ' ' && *np != '\t') ++np;
                 }
@@ -1024,7 +1055,13 @@ namespace fsd {
         if (espDots.empty()) return;
         const int vw = viewW > 0 ? viewW : width;
         const int vh = viewH > 0 ? viewH : height;
+        // ---- 雷达点先收集，最后统一画在左下角的小圆盘上 ----
+        int radar[64][3], nRadar = 0;
         for (auto& e : espDots) {
+            if (e.kind == L'R') {
+                if (nRadar < 64) { radar[nRadar][0] = (int)e.x1; radar[nRadar][1] = (int)e.y1; radar[nRadar][2] = (int)e.d; nRadar++; }
+                continue;
+            }
             int x1 = MulDiv((int)e.x1, width, vw), y1 = MulDiv((int)e.y1, height, vh);
             int x2 = MulDiv((int)e.x2, width, vw), y2 = MulDiv((int)e.y2, height, vh);
             if (x2 < x1) { int t = x1; x1 = x2; x2 = t; }
@@ -1032,12 +1069,168 @@ namespace fsd {
             int w = x2 - x1, h = y2 - y1;
             if (w < S(4) || h < S(4)) continue;
             if (x1 >= width || y1 >= height || x2 < 0 || y2 < 0) continue;
-            COLORREF c = (e.kind == L'E') ? RGB(255, 70, 70) : RGB(90, 225, 255);
+            COLORREF c = (e.kind == L'E') ? RGB(255, 70, 70) : ((e.kind == L'T') ? RGB(90, 255, 120) : RGB(90, 225, 255));
             Border(x1, y1, w, h, RGB(0, 0, 0), 170);
             Border(x1 + 1, y1 + 1, w - 2, h - 2, c, 235);
-            // 标签：怪物/矿石名字 + 距离（名字是游戏内 Lua 给的 UTF-8）
+            // 标签：名字 + 距离（+ v55：生命/护甲，仿 DX11 修改器的写法）
             std::wstring label = e.name;
             if (!label.empty()) label += L" ";
+            wchar_t db[64] = L"";
+            if (e.hp >= 0 || e.sh >= 0) {
+                swprintf_s(db, L"%dm 生命%d 甲%d", (int)e.d, (int)(e.hp < 0 ? 0 : e.hp), (int)(e.sh < 0 ? 0 : e.sh));
+            } else {
+                swprintf_s(db, L"%dm", (int)e.d);
+            }
+            label += db;
+            if (e.kind == L'T' && e.down) label = L"☠ " + label + L" 倒地";
+            int tw = TextW(label);
+            int lx = x1 + w / 2 - tw / 2;
+            if (lx < 0) lx = 0;
+            Text(lx, y1 - LineH(), label, c, 255, true);
+            Text(lx + 1, y1 - LineH() + 1, label, RGB(0, 0, 0), 120, true);
+        }
+        // ---- 雷达：左下角圆盘（外圈 100m），正前方朝上 ----
+        if (nRadar > 0) {
+            int R = S(78), cx = S(20) + R, cy = height - S(20) - R;
+            Fill(cx - R, cy - R, R * 2, R * 2, RGB(10, 12, 16), 120);
+            // 圆盘边框（用点画圆，避免实心遮太多）
+            for (int i = 0; i < 360; i += 3) {
+                double a = i * 3.14159265 / 180.0;
+                int px = cx + (int)(R * cos(a)), py = cy + (int)(R * sin(a));
+                Fill(px - S(1), py - S(1), S(2), S(2), RGB(200, 210, 230), 200);
+            }
+            Fill(cx - S(1), cy - S(1), S(2), S(2), RGB(255, 255, 255), 230);
+            Fill(cx - S(1), cy - R, S(2), S(5), RGB(255, 255, 255), 200);      // 正前方刻度
+            for (int i = 0; i < nRadar; ++i) {
+                double ang = radar[i][0] * 3.14159265 / 180.0;                 // 0=正前，顺时针
+                double rr = radar[i][1] / 100.0; if (rr > 1.0) rr = 1.0;
+                int px = cx + (int)(sin(ang) * R * rr), py = cy - (int)(cos(ang) * R * rr);
+                COLORREF c = (radar[i][2] == 2) ? RGB(90, 225, 255) : ((radar[i][2] == 3) ? RGB(90, 255, 120) : RGB(255, 80, 80));
+                Fill(px - S(2), py - S(2), S(4), S(4), c, 235);
+            }
+        }
+    }
+
+    // ---------------- 自瞄叠层（显示索敌范围）----------------
+    // 数据来自游戏内 Lua 引擎（30ms 一轮）写出的 FSDTrainer_aim.txt：
+    //   R <屏幕x> <屏幕y>                    索敌圈上的一个点（水平圆，半径 = 自瞄范围 米）
+    //   A <左> <上> <右> <下> <距离> <名字>   当前锁定的敌人
+    bool Ui::AimWanted() {
+        for (auto& f : g_features.list) {
+            if (f.kind != "cheat") continue;
+            if (f.key == "aim_show_range" && f.cur > 0) return true;
+        }
+        return false;
+    }
+
+    void Ui::LoadAim() {
+        ULONGLONG now = GetTickCount64();
+        if (now - aimReadAt < 100) return;
+        aimReadAt = now;
+        std::wstring dir(LogPath());
+        size_t p = dir.find_last_of(L"\\/");
+        dir = (p == std::wstring::npos) ? std::wstring() : dir.substr(0, p + 1);
+        std::wstring file = dir + L"FSDTrainer_aim.txt";
+        WIN32_FILE_ATTRIBUTE_DATA fa = {};
+        if (!GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &fa)) return;
+        ULONGLONG t = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        if (t == aimFileTime) return;
+        aimFileTime = t;
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, file.c_str(), L"rb") != 0 || !f) return;
+        std::vector<EspDot> tmp;
+        char line[220];
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] != 'R' && line[0] != 'A') continue;
+            float a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0;
+            int got = sscanf_s(line + 1, "%f %f %f %f %f", &a1, &a2, &a3, &a4, &a5);
+            EspDot e; e.kind = (wchar_t)line[0];
+            if (line[0] == 'R') {
+                if (got < 2) continue;
+                e.x1 = a1; e.y1 = a2;
+            } else {
+                if (got < 5) continue;
+                e.x1 = a1; e.y1 = a2; e.x2 = a3; e.y2 = a4; e.d = a5;
+                const char* np = line + 1;                 // 第 6 项起是名字（UTF-8）
+                for (int k = 0; k < 5 && *np; ++k) {
+                    while (*np == ' ' || *np == '\t') ++np;
+                    while (*np && *np != ' ' && *np != '\t') ++np;
+                }
+                while (*np == ' ' || *np == '\t') ++np;
+                if (*np) {
+                    std::string nm8(np);
+                    while (!nm8.empty() && (nm8.back() == '\r' || nm8.back() == '\n' || nm8.back() == ' ')) nm8.pop_back();
+                    if (!nm8.empty()) {
+                        int wn = MultiByteToWideChar(CP_UTF8, 0, nm8.data(), (int)nm8.size(), nullptr, 0);
+                        if (wn > 0) { std::wstring w(wn, L'\0'); MultiByteToWideChar(CP_UTF8, 0, nm8.data(), (int)nm8.size(), &w[0], wn); e.name = w; }
+                    }
+                }
+            }
+            tmp.push_back(e);
+        }
+        fclose(f);
+        aimDots.swap(tmp);
+        aimDirty = true;
+    }
+
+    void Ui::DrawAim() {
+        // 1) 索敌范围：屏幕中心展开的白色空心细圈（半径由「自瞄范围」决定，只跟数值有关，不受目标影响）
+        for (auto& f : g_features.list) {
+            if (f.kind != "cheat") continue;
+            if (f.key == "aim_show_range") {
+                if (f.cur <= 0) break;                       // 开关没开：不画圈
+                double rng = 30.0;
+                for (auto& g : g_features.list)
+                    if (g.kind == "cheat" && g.key == "aim_range") rng = g.cur;
+                if (rng < 1) rng = 1;
+                int rad = (int)(S(4) * rng);                 // 约 4 像素/米（跟着分辨率缩放）
+                int maxR = (width < height ? width : height) / 2 - S(6);
+                if (rad < S(24)) rad = S(24);
+                if (rad > maxR) rad = maxR;
+                int cx = width / 2, cy = height / 2;
+                int dot = S(2);
+                // 整数中点画圆（薄空心圈，不用数学库）
+                auto plot = [&](int px, int py) {
+                    if (px < 0 || py < 0 || px >= width || py >= height) return;
+                    Fill(px - dot / 2, py - dot / 2, dot, dot, RGB(255, 255, 255), 230);
+                };
+                int x0 = rad, y0 = 0, err = 1 - rad;
+                while (x0 >= y0) {
+                    plot(cx + x0, cy + y0); plot(cx + y0, cy + x0);
+                    plot(cx - y0, cy + x0); plot(cx - x0, cy + y0);
+                    plot(cx - x0, cy - y0); plot(cx - y0, cy - x0);
+                    plot(cx + y0, cy - x0); plot(cx + x0, cy - y0);
+                    ++y0;
+                    if (err < 0) err += 2 * y0 + 1;
+                    else { --x0; err += 2 * (y0 - x0) + 1; }
+                }
+                break;
+            }
+        }
+        // 2) 当前锁定的敌人（游戏内引擎写来的 A 行）
+        if (aimDots.empty()) return;
+        const int vw = viewW > 0 ? viewW : width;
+        const int vh = viewH > 0 ? viewH : height;
+        for (auto& e : aimDots) {
+            if (e.kind == L'R') {
+                int px = MulDiv((int)e.x1, width, vw), py = MulDiv((int)e.y1, height, vh);
+                if (px < 0 || py < 0 || px >= width || py >= height) continue;
+                int s = S(3);
+                Fill(px - s / 2, py - s / 2, s, s, RGB(70, 255, 140), 205);
+                continue;
+            }
+            int x1 = MulDiv((int)e.x1, width, vw), y1 = MulDiv((int)e.y1, height, vh);
+            int x2 = MulDiv((int)e.x2, width, vw), y2 = MulDiv((int)e.y2, height, vh);
+            if (x2 < x1) { int t = x1; x1 = x2; x2 = t; }
+            if (y2 < y1) { int t = y1; y1 = y2; y2 = t; }
+            int w = x2 - x1, h = y2 - y1;
+            if (w < S(4) || h < S(4)) continue;
+            if (x1 >= width || y1 >= height || x2 < 0 || y2 < 0) continue;
+            COLORREF c = RGB(255, 215, 60);            // 锁定目标：黄色
+            Border(x1, y1, w, h, RGB(0, 0, 0), 170);
+            Border(x1 + 1, y1 + 1, w - 2, h - 2, c, 240);
+            std::wstring label = L"锁 ";
+            if (!e.name.empty()) { label += e.name; label += L" "; }
             wchar_t db[32] = L"";
             swprintf_s(db, L"%dm", (int)e.d);
             label += db;
@@ -1077,12 +1270,19 @@ namespace fsd {
         qkeys = fin.keys;
 
         if (!visible) {
-            // 菜单隐藏但 ESP 开着：只在 ESP 数据更新时重画一次（约 1 次/秒），不做每帧上传
-            if (EspWanted()) {
-                LoadEsp();
-                if (needClear || espDirty) {
-                    needClear = false; espDirty = false;
-                    ClearAll(); DrawEsp(); dirty = true; MaybeDump(); return true;
+            // 菜单隐藏但 ESP / 自瞄叠层开着：只在数据更新时重画一次（约 1 次/秒），不做每帧上传
+            bool wantE = EspWanted(), wantA = AimWanted();
+            if (wantE || wantA) {
+                if (wantE) LoadEsp();
+                if (wantA) LoadAim();
+                // 自瞄"显示范围"的白圈是常驻 HUD（跟数据无关）：菜单关掉后也要一直看得见，
+                // 所以额外按 4Hz 心跳重画一次，防止被别的清屏/重绘吃掉。
+                ULONGLONG t2 = GetTickCount64();
+                bool beat = wantA && (t2 - aimDrawAt > 250);
+                if (needClear || espDirty || aimDirty || beat) {
+                    if (beat) aimDrawAt = t2;
+                    needClear = false; espDirty = false; aimDirty = false;
+                    ClearAll(); if (wantE) DrawEsp(); if (wantA) DrawAim(); dirty = true; MaybeDump(); return true;
                 }
                 return false;
             }
@@ -1094,10 +1294,15 @@ namespace fsd {
         lastDraw = now;
 
         // 页签 = 功能表的分类（来自 ini 的 cat=） + 设置（+ 高级页）
+        // v61：「调试数据」不再是普通页签，归到"高级功能"里（「显示高级功能」关闭时看不到它）
         static std::vector<std::string> cats;
         cats = g_features.Categories();
+        bool hasDebug = false;
+        for (auto it = cats.begin(); it != cats.end(); ) {
+            if (*it == "调试数据") { hasDebug = true; it = cats.erase(it); } else ++it;
+        }
         const int nCat = (int)cats.size();
-        const int nAdv = advanced ? 2 : 0;
+        const int nAdv = advanced ? (2 + (hasDebug ? 1 : 0)) : 0;
         const int nTab = nCat + 1 + nAdv;
         if (tab >= nTab) tab = 0;
         for (size_t i = 0; i < qkeys.size();) {
@@ -1221,9 +1426,9 @@ namespace fsd {
             const wchar_t* nm = L"设置";
             if (i < nCat) { tmp = W(cats[i].c_str()); nm = tmp.c_str(); }
             else if (i > nCat) {
-                static const wchar_t* advNames[] = { L"扫描", L"冻结" };
+                static const wchar_t* advNames[] = { L"扫描", L"冻结", L"调试数据" };
                 int k = i - nCat - 1;
-                nm = (k >= 0 && k < 2) ? advNames[k] : L"?";
+                nm = (k >= 0 && k < 3) ? advNames[k] : L"?";
             }
             if (Button(tx + i * (tw0 + S(6)), ty, tw0, S(30), nm, tab == i)) tab = i;
         }
@@ -1235,16 +1440,18 @@ namespace fsd {
         if (tab < nCat) PageGame(cx, cy, cw, ch, cats[tab]);
         else if (tab == nCat) PageSettings(cx, cy, cw, ch);
         else {
-            // 高级页只保留「扫描 / 冻结」；补丁 / 命令 / 参考三页按用户要求删除
+            // 高级页：扫描 / 冻结 / 调试数据（补丁 / 命令 / 参考三页按用户要求删除）
             switch (tab - nCat - 1) {
             case 0: PageScan(cx, cy, cw, ch); break;
+            case 2: PageGame(cx, cy, cw, ch, "调试数据"); break;
             default: PageFreeze(cx, cy, cw, ch); break;
             }
         }
         if (!note.empty()) TextF(wx + S(16), wy + winH - S(30), kColAcc2, L"● %s", note.c_str());
 
-        // ESP 画在最上层（菜单开着也显示）
+        // ESP / 自瞄叠层画在最上层（菜单开着也显示）
         if (EspWanted()) { LoadEsp(); DrawEsp(); }
+        if (AimWanted()) { LoadAim(); DrawAim(); }
 
         // 软件光标：全屏独占 / 游戏隐藏光标时菜单仍然可见可点
         if (in && in->mx >= 0 && in->my >= 0) {

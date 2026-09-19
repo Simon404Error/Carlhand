@@ -308,12 +308,14 @@ static DWORD WINAPI NeutralizeCmdThread(LPVOID param) {
 static void DeployLuaEngine(const std::wstring& luaPath, const std::wstring& cmdPath) {
     FILE* fp = nullptr;
     if (_wfopen_s(&fp, luaPath.c_str(), L"wb") == 0 && fp) {
-        for (int i = 0; i < kCheatEngineLuaPartCount; ++i) {
+        // ★v96：用数组实际长度算块数（不再信任那个常量），双保险
+        const int nParts = (int)(sizeof(kCheatEngineLuaParts) / sizeof(kCheatEngineLuaParts[0]));
+        for (int i = 0; i < nParts; ++i) {
             const char* part = kCheatEngineLuaParts[i];
             fwrite(part, 1, strlen(part), fp);
         }
         fclose(fp);
-        Log("游戏内引擎脚本已部署: %s（%d 块）", Narrow(luaPath).c_str(), kCheatEngineLuaPartCount);
+        Log("游戏内引擎脚本已部署: %s（%d 块）", Narrow(luaPath).c_str(), nParts);
     } else {
         Log("引擎脚本写入失败: %s", Narrow(luaPath).c_str());
     }
@@ -386,6 +388,16 @@ static void HotkeyThread() {
             }
             lastRestore = cur;
         }
+        // 备用菜单键 F6（用户的 DX11 修改器用 Insert/F6，我们跟上）
+        {
+            static bool lastF6 = false;
+            bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+            if (f6 && !lastF6) {
+                Ui* ui = g_overlay.GetUi();
+                if (ui) { ui->Toggle(); CursorShow(ui->visible); Log("热键 F6: 菜单%s", ui->visible ? "打开" : "关闭"); }
+            }
+            lastF6 = f6;
+        }
         if (g_cfg.menuKey) {
             bool cur = (GetAsyncKeyState((int)g_cfg.menuKey) & 0x8000) != 0;
             if (cur && !lastMenu) {
@@ -409,6 +421,26 @@ static void HotkeyThread() {
                 if (ui) { ui->ResetWindow(); CursorShow(true); Log("热键 HOME: 菜单已复位到屏幕中央"); }
             }
             lastReset = cur;
+        }
+        // 鼠标左键状态 → 写给游戏内引擎（自瞄的"左键触发"）：只在变化时重写状态文件，避免刷盘
+        {
+            static bool lastLmb = false;
+            bool cur = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            if (cur != lastLmb) {
+                lastLmb = cur;
+                SetInputLmb(cur);
+                g_features.WriteFeaturesFile();
+            }
+        }
+        // 跳跃键（空格）状态 → 写给引擎（喷气靴"按住才喷、松开就停"）：同样只在变化时写
+        {
+            static bool lastJump = false;
+            bool cur = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+            if (cur != lastJump) {
+                lastJump = cur;
+                SetInputJump(cur);
+                g_features.WriteFeaturesFile();
+            }
         }
         for (size_t i = 0; i < g_patches.defs.size(); ++i) {
             UINT k = g_patches.defs[i].hotkey;

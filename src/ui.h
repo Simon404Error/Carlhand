@@ -102,7 +102,7 @@ namespace fsd {
         bool Button(int x, int y, int w, int h, const std::wstring& label, bool active = false, bool enabled = true);
         bool Checkbox(int x, int y, const std::wstring& label, bool& value);
         bool Slider(int id, int x, int y, int w, int h, double& v, double lo, double hi);
-        bool InputBox(int id, int x, int y, int w, int h, std::wstring& buf, bool numeric);
+        bool InputBox(int id, int x, int y, int w, int h, std::wstring& buf, bool numeric, bool dec1 = false);
         void Progress(int x, int y, int w, int h, int pct);
 
         void PageGame(int x, int y, int w, int h, const std::string& cat);   // 游戏功能页（常规/武器道具/…）
@@ -113,12 +113,23 @@ namespace fsd {
         void PageFeatures(int x, int y, int w, int h);
         void PageSettings(int x, int y, int w, int h);
 
-        // ESP：读游戏内 Lua 算好的屏幕包围盒（x1 y1 x2 y2 距离 名字）并画框
-        struct EspDot { float x1 = 0, y1 = 0, x2 = 0, y2 = 0, d = 0; wchar_t kind = L'E'; std::wstring name; };
+        // ESP：读游戏内 Lua 算好的屏幕包围盒并画框（v55：E/M 敌人矿物、T 队友、R 雷达点）
+        struct EspDot { float x1 = 0, y1 = 0, x2 = 0, y2 = 0, d = 0; float hp = -1, sh = -1; int down = 0;
+                        wchar_t kind = L'E'; std::wstring name; };
         std::vector<EspDot> espDots;
         ULONGLONG espReadAt = 0, espFileTime = 0;
         bool      espDirty = false;
         void LoadEsp();
         void DrawEsp();
+
+        // 自瞄叠层（功能表 aim_show_range=1 时）：读 FSDTrainer_aim.txt，画索敌圈（R 行，圈上的点）与
+        // 当前锁定目标（A 行，黄框 + 名字/距离）。故意和 ESP 用两个文件，避免两者互相覆盖。
+        std::vector<EspDot> aimDots;
+        ULONGLONG aimReadAt = 0, aimFileTime = 0;
+        ULONGLONG aimDrawAt = 0;                 // 菜单隐藏时白圈的重画心跳
+        bool      aimDirty = false;
+        bool AimWanted();
+        void LoadAim();
+        void DrawAim();
     };
 }

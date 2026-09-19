@@ -78,6 +78,14 @@ namespace fsd {
     extern Freezer      g_freezer;      // 冻结器（全局，定义在 dllmain.cpp）
     extern PatchEngine  g_patches;      // 补丁引擎（全局）
 
+    // 鼠标左键状态：dllmain 的输入线程探测后写进功能状态文件（lmb=0/1），供自瞄"左键触发"用。
+    // 走 DLL 而不是引擎侧调游戏 API：实测引擎里调 IsInputKeyDown 会直接崩游戏（2026-09-19 11:58 崩溃）。
+    void SetInputLmb(bool down);
+
+    // 跳跃键（空格）状态：喷气靴要"按住才喷、松开就停"。引擎里读不到按键（IsInputKeyDown 会崩游戏），
+    // 所以 dllmain 每帧探测 GetAsyncKeyState(VK_SPACE)，写进功能状态文件 jmp=0/1。
+    void SetInputJump(bool down);
+
     // UE 控制台（可选功能，需在 ini 中配置特征码）
     namespace game {
         void Init(const Config& cfg);

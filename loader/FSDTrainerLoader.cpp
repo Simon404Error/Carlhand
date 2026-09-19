@@ -316,7 +316,7 @@ int wmain(int argc, wchar_t** argv) {
                     else
                         ws.assign(buf.begin(), buf.begin() + rd);
                     stale = ws.find(L"[feature.") == std::wstring::npos
-                         || ws.find(L"ini_ver=46") == std::wstring::npos;   // 版本不符 → 重新部署功能表
+                         || ws.find(L"ini_ver=74") == std::wstring::npos;   // 版本不符 → 重新部署功能表
                 }
             }
             if (!FileExists(gameIni) || stale) {

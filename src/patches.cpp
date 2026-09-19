@@ -5,6 +5,13 @@
 
 namespace fsd {
 
+    // 左键状态（由 dllmain 的输入线程更新），随功能状态文件一起写给游戏内引擎
+    static bool g_inputLmb = false;
+    void SetInputLmb(bool down) { g_inputLmb = down; }
+    // 跳跃键（空格）状态：喷气靴"按住才喷、松开就停"要用
+    static bool g_inputJump = false;
+    void SetInputJump(bool down) { g_inputJump = down; }
+
     void PatchEngine::Load(std::vector<PatchDef>&& src) {
         defs = std::move(src);
         for (auto& p : defs) {
@@ -103,6 +110,9 @@ namespace fsd {
             f.unit = Get(L"unit", L"");
             f.def = atof(Get(L"def", L"1").c_str());
             f.cur = f.def;
+            // 开关型（ui=toggle）的"开/关"状态存在 f.on 上（状态文件写的就是它），
+            // 所以 ini 里 def=1 的开关要在加载时就置成"开"，否则界面/引擎都当成关。
+            if (f.ui == "toggle" && f.kind == "cheat") f.on = (f.def != 0.0);
             f.mult = GetPrivateProfileIntW(s, L"mult", 0, iniPath.c_str()) != 0;
             f.clientOnly = GetPrivateProfileIntW(s, L"client", 0, iniPath.c_str()) != 0;
             f.sealed = GetPrivateProfileIntW(s, L"sealed", 0, iniPath.c_str()) != 0;
@@ -247,6 +257,9 @@ namespace fsd {
             else sprintf_s(line, "%s=%d\r\n", f.key.c_str(), f.on ? 1 : 0);
             body += line;
         }
+        // 鼠标左键状态（自瞄"左键触发"用）：不是功能项，只是借这个文件传给游戏内引擎
+        body += (g_inputLmb ? "lmb=1\r\n" : "lmb=0\r\n");
+        body += (g_inputJump ? "jmp=1\r\n" : "jmp=0\r\n");
         FILE* fp = nullptr;
         if (_wfopen_s(&fp, featPath.c_str(), L"wb") != 0 || !fp) { Log("状态文件写入失败: %s", Narrow(featPath).c_str()); return false; }
         fwrite(body.data(), 1, body.size(), fp);

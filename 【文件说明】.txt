@@ -370,3 +370,1145 @@ v39 改成"自己算投影"：
      UI 侧同时 valBuf.clear()，输入框下一帧就按默认值重填（以前只关开关、数值留着）。
 三、新增 功能对照表.md（93 项 Carlhand 功能 × 266 条游戏命令）
   - 已接上且有效约 35 项；游戏有命令、我们还没做的约 45 项（多数直发即可）；游戏没有命令的靠属性/自己实现。
+【2026-09-19 11:4x · v49（奔跑速度终于修好：冲刺速度在 RunningSpeed 上，不在 MaxWalkSpeed）】
+一、真因（游戏内实测，不是猜的）
+  1) 用 UE4SS 反射接口把类链属性/函数名转储到 dump 才看清结构：
+     太空站角色 = BP_NavigatorCharacter_C → BP_PlayerCharacter_C → /Script/FSD.PlayerCharacter，
+     移动组件 = /Script/FSD.PlayerMovementComponent（有 DebugFastMove / MovementPenalty）。
+  2) 关键属性：FSD.PlayerCharacter.RunningSpeed = 435.0（冲刺）、CharacterMovement.MaxWalkSpeed = 300（走路）。
+  3) 模拟按键在太空站实测（AppActivate + keybd_event W/Shift）：
+     · 按住 W：水平速度 V=300，MaxWalkSpeed=300，IsRunning=false
+     · W+Shift：V=435，而 MaxWalkSpeed 仍然是 300！IsRunning=true
+     → **游戏的冲刺根本不改 MaxWalkSpeed**，所以 v44~v48"抢写 MaxWalkSpeed"的思路永远不可能生效
+       （dump 里那条 60ms 冲刺循环从来没打出过任何一次写入，就是这个原因）。
+  4) 把 RunningSpeed 直接改成 1305：同一秒冲刺 V 就变成 1305（走路仍 300），改回 435 立刻恢复 435。
+二、v49 改动
+  1) src\cheat_engine.h：引擎版本 v49（__FSDT_ENGINE_V49）。新增 applyRun()：把角色的 RunningSpeed
+     写成"冲刺基准×奔跑倍率"（基准每个角色只读一次，默认 435）；60ms 小循环改成只调它，
+     所以改数值 60ms 内生效、不用重新按 Shift；换图/重生时基准重新读。
+  2) 走路仍然只写 MaxWalkSpeed = 走路基准×移速倍率；新增保护：当前值明显高于走路目标、且不是我们写的
+     （游戏自己在滑铲/冲刺）时不去抢；"恢复默认"仍会把我们写进去的残留加速回落。
+  3) 删掉 v48 的"抢 MaxWalkSpeed"冲刺逻辑和 sprintProbe 属性探测（已无用，还白占 16KB 块空间）。
+  4) config\FSDTrainer.ini：sprint_speed 说明改写；ini_ver=46 → 47；loader\FSDTrainerLoader.cpp 同步改查 ini_ver=47。
+三、实测验证（本次会话，太空站，用已发布的 v49 exe）
+  · sprint_speed=3 → dump：`[奔跑] 冲刺基准435.00×3.00=1305.00 读回=1305.0`；
+    按 W+Shift 采样：V=1305（走路段 V=300，MaxWalkSpeed 全程 300）。
+  · sprint_speed 改回 1 → `[奔跑] 冲刺基准435.00×1.00=435.00 读回=435.0`（恢复游戏原速）。
+四、可复用的排查手法（已写进交接文档第 8 节）
+  · 临时探针不用重编 DLL：把 lua 文件丢进游戏目录，往 FSDTrainer_cmd.txt 写 `lua 文件名`，执行器 v7 会热载。
+  · 反射转储：c:ForEachProperty / c:ForEachFunction + c:GetSuperStruct() 遍历类链（UE4SS 3.0.1 支持）。
+  · 反面教材：`CallFunction(fn,true)` 失败后直接 `fn(pawn,true)` → C++ 异常把 Lua 线程打死（心跳都停了），
+    只能重开游戏。以后调游戏函数前先确认签名。
+【2026-09-19 11:5x · v50（自瞄范围真正落地）+ 工作目录整理】
+一、自瞄范围：为什么以前不行
+  1) 老做法（v11~v49）是把一批猜出来的 `AimRange/AimAssistStrength/AutoAimRange...` 属性乘倍数。
+     这次用反射转储把 PC / Pawn / CameraManager 的类链属性+函数全打出来看：**游戏里根本没有这些字段**，
+     所以属性探测永远命中不了。顺带发现有用的是 `FSD.PlayerCharacter.AimSettings`(struct AnalogAimSettings)、
+     `RecoilComponent`（CharacterRecoilComponent：Recoil/RecoilVelocity/PrevError）、`CanAim`。
+  2) 结论：DRG 没有"可调的辅助瞄准范围"这种属性，自瞄只能自己做。
+二、v50 实现（真自瞄）
+  1) 关键 API（都实测过）：`pc:GetControlRotation()` 返回 table{Pitch,Yaw,Roll}（Pitch 可能是 337.9 这种
+     未归一化值）；`PlayerCameraManager:GetCameraLocation()` 返回 table{X,Y,Z}；`pc:SetControlRotation({...})`
+     写进去能生效（读回与写入完全一致）。敌人 = `FindAllOf("Pawn")` 里类名含 `/Game/Enemies/` 的（例
+     ENE_Spider_Grunt_Ice_C）；坐标用 `K2_GetActorLocation()`。
+  2) 引擎新增第 4 条循环 `LoopAsync(30)`：每 0.45 秒重扫一次最近敌人（枚举 Pawn 贵），每 30ms 用相机位置
+     指向"敌人位置+25cm"算 pitch/yaw 并 `SetControlRotation`；目标消失/出范围自动松开。
+  3) 菜单：`[feature.自瞄范围]` 的 `lo=0 hi=10 unit=强度` 改成 `lo=0 hi=200 unit=米`，0=关；
+     删掉旧的 AIM_CANDS 属性乘倍数逻辑；引擎版本 v50，ini_ver=47→48（loader 同步改查 48）。
+  4) 实测（11:46 用户那一局任务里，用热载探针）：合成点 +30° → 写 yaw=33.96 读回 33.96；真敌人 17.3m →
+     写 pitch=16.01 yaw=88.78 读回完全一致；v50 引擎载入后日志出现 `[自瞄] 已就绪（范围=25.00米）`（无异常）。
+     （子弹是否真的按新朝向飞出去，要用户进任务打一枪确认——机制上 DRG 射击用相机朝向，所以应该是准的。）
+三、工作目录整理（删了 39 个文件）
+  · tools\ 里 22 个一次性打补丁脚本全删（patch_v41…patch_v48 / seal_* / patch_esp / patch_executor /
+    patch_shippable* / patch_speed2 / patch_features_v43 / split_part / repair_ini / mk_verify_ini）——
+    源码早就打完补丁了，留着只会误用。保留：extract_lua / partscheck / crash_summary / dumpinfo /
+    peexp / peinfo / dumpsig / ue4ss_probe / lint_lua / list_features / monitor_game / features_list.txt。
+  · build\convert_features.ps1（无人引用）、config\FSDTrainer.ini.bak（旧备份）删。
+  · out\：monitor.log / monitor.pid / kill_zombie.txt 删；verify\ 里 11.8MB 的 UE4SS.log、
+    FSDTrainer.log、ui.bmp、fake.txt 等测试残留删（跑 build\test.bat 会重新生成）。
+  · 界面截图只留最新的：ui_v46 / ui_settings / ui_sealed / ui_menu_dx12 / esp_test3；删 ui_v43/43b/44/45。
+  · 没动的：reference\（含 50MB 的 FSDConsole 第三方工具+字符串 dump，仍有查命令的价值）、
+    backup_ue4ssl\（用户那个 DX11 修改器的加载器备份）、_github\Carlhand（GitHub 快照仓库，停在 v1.0，未推送）。
+【2026-09-19 12:1x · v51（自瞄三个开关：隔墙瞄准 / 左键触发 / 显示索敌范围）】
+一、用户要的三个开关 → 实现方式
+  1) 隔墙瞄准 aim_wall（默认 1=隔墙也锁）：
+     aim_wall=0 时只有"看得见"的怪才锁。用的是游戏自己的 AController::LineOfSightTo。
+     ★ 坑：`pc:LineOfSightTo(t)` 只传 1 个参数会报错（pcall 能接住，不崩），必须写满：
+       `pc:LineOfSightTo(t,{X=0,Y=0,Z=0},false)`，ViewPoint 全 0 = 用相机位置（UE4 源码默认行为）。
+  2) 左键/自动触发 aim_auto（默认 1=一直自动）：
+     aim_auto=0 时只在你按住鼠标左键期间锁。
+     ★ 大坑：本来想在 Lua 里用 `pc:IsInputKeyDown({KeyName="LeftMouseButton"})` 判断，实测 **直接把游戏打崩**
+       （11:58 生成 crash_2026_09_19_03_58_44.dmp，Lua 线程一起死）。改成 **DLL 侧探测**：
+       HotkeyThread 里 `GetAsyncKeyState(VK_LBUTTON)`，状态变化时把 `lmb=0/1` 追加写进
+       FSDTrainer_features.txt（patches.cpp 的 WriteFeaturesFile / SetInputLmb），引擎每 30ms 读一次。
+       实测日志：`[自瞄] 左键按下 → 开始锁` / `[自瞄] 左键松开 → 暂停锁`。
+  3) 显示索敌范围 aim_show_range（默认 0）：
+     引擎把"以玩家为圆心、半径=自瞄范围米的水平圆"采 48 个点，用现有的投影函数投到屏幕，写到新文件
+     FSDTrainer_aim.txt（`R x y` = 圈点，`A x1 y1 x2 y2 距离 名字` = 当前锁定目标）；DLL 侧新增
+     Ui::AimWanted / LoadAim / DrawAim：绿点画圈、黄框+“锁 名字 Nm”标高亮锁定目标。故意和 ESP 用两个文件。
+     关闭时引擎写一行 "# 自瞄叠层关闭" 让 DLL 清掉。
+二、验证（都做了）
+  · 左键链路：游戏内实测日志（见上），DLL→文件→引擎 全通。
+  · 索敌圈/锁定框绘制：用离线 UI 测试台（build\test.bat → out\verify\Dx12Test.exe 自加载 DLL，
+    ini 里 menu_open=0 + aim_show_range=1，伪造 FSDTrainer_aim.txt）跑出 out\verify\aim_overlay_test.png：
+    能清楚看到绿色圆点圈 + 黄色框 + "锁 测试虫 18m"。
+  · LineOfSightTo：探针实测 1 参数报错 / 3 参数正常返回 true（太空站里对玩家自己）。
+  · 三个开关都在 常规页，值 0/1；aim_range 仍是 0~200 米。
+三、产物
+  · 源码：src\cheat_engine.h（引擎 v51）、src\patches.cpp/.h（lmb 状态）、src\dllmain.cpp（左键探测）、
+    src\ui.cpp/.h（自瞄叠层绘制）、config\FSDTrainer.ini（三个新功能段，ini_ver=48→49，
+    loader\FSDTrainerLoader.cpp 同步改查 ini_ver=49）。
+  · 已构建：out\Carlhand.exe / out\FSDTrainer.dll，并已注入到用户当时正在玩的游戏里（引擎 v51 已载入）。
+四、注意
+  · 测试时我临时把游戏目录里 ini 的 aim_range/aim_auto 默认值改过，已改回 0/1；当前那一局的
+    aim_range 还是 60、aim_auto=0（DLL 内存里的值），重启或菜单里改一下就复位。
+【2026-09-19 12:2x · v52（自瞄界面重做：总开关 / “镇魂机枪” / 显示范围白圈 / 平滑度）】
+一、按用户要求改的 5 件事
+  1) 新增自瞄总开关（常规页最上面）`[feature.自瞄]` key=aim_on，ui=toggle，默认关；
+     引擎里 `aim_on=0` 或 `aim_range<=0` 都算关闭。
+  2) 隔墙瞄准 / 自动触发自瞄 / 显示索敌范围 三个改成"开关按键"（新 UI 类型 ui=toggle），
+     紧跟「自瞄范围」下面，默认全部关闭：
+       隔墙瞄准(aim_wall) 0=只锁看得见的（默认）
+       “镇魂机枪”(aim_auto) 0=只在你按住左键时锁（默认），1=一直自动锁
+       显示范围(aim_show_range) 0=不画（默认），1=画
+  3) 自动触发自瞄 → 改名 **“镇魂机枪”**（含全角引号，ini 段名就是 [feature.“镇魂机枪”]）——注意它目前仍是
+     "自动/左键触发"的语义，**没有**做自动开火；要不要加自动开火等用户说。
+  4) 显示索敌范围 → 改名 **显示范围**，画法改成"屏幕中心展开的白色空心细圈"：
+     DLL 侧自己按 `自瞄范围` 算半径（约 4 像素/米 × uiScale，最大到屏幕半高-6），用整数中点画圆；
+     引擎不再写 R 行（原来那圈是地面水平圆，已废弃）。锁定目标仍然用黄色框 + "锁 名字 Nm"。
+  5) 新增 **自瞄平滑度** `[feature.自瞄平滑度]` key=aim_smooth 0~100（默认 0=瞬间锁，推荐 40~70）：
+     每 tick 读 `pc:GetControlRotation()` 按最短角度路径插值，k=1-(平滑度/100)*0.92。
+     ★ 坑：插值后的 pitch 必须归一化到 [-180,180]，否则从 337.9(=-22°) 往 -20° 靠时会写出 340，
+       被游戏俯仰限位（±89.9）一夹就突然抬头。
+二、UI 改动（src\ui.cpp）
+  · 新增 `ui=toggle` 支持：功能列表里直接画"已开启/已关闭"按钮 + 状态列"● 开 / ○ 关"。
+    以前 PageGame 只渲染 value/slider，**toggle 型功能是靠页面底部那个单独的"开关"网格显示的**——
+    为了让"自瞄/自瞄范围/隔墙瞄准/“镇魂机枪”/显示范围/自瞄平滑度"能按 ini 顺序紧挨着排，现在
+    toggle 全部并到同一条列表里，底部"开关"网格已删除（"动作"网格保留）。
+  · 顺带：常规页现在把 8 个开关型功能（怪物全灭/飞行模式/显示队友/显示雷达/无限跳跃/夜视/霸体/无敌+复活）
+    也按 ini 顺序排进列表，不再单独占一块网格。
+三、验证
+  · 离线 UI 测试台（out\verify\Dx12Test.exe + 伪造 FSDTrainer_aim.txt）出图 out\verify\aim_ui_v52.png：
+    能看到 `自瞄 [已开启]` → `自瞄范围 60.00` → `隔墙瞄准 [已关闭] ○关` 的顺序、屏幕中心白色空心细圈、
+    以及黄色"锁 测试虫 18m"框。
+  · 游戏内：v52 载入后 features 默认全 0（aim_on/aim_wall/aim_auto/aim_show_range/aim_smooth），
+    手动置 aim_on=1、aim_smooth=60 → 日志 `[自瞄] 已就绪（范围=30.00米，平滑度=60.00）`；异常 0 条。
+  · ini_ver 49→50（loader 同步改），aim_range 默认从 0 改成 30（现在由总开关管开关）。
+四、产物
+  · out\Carlhand.exe / out\FSDTrainer.dll（v52，已注入并跑在用户机器上）
+  · 源码：src\cheat_engine.h（引擎 v52）、src\ui.cpp（toggle 行 + 白圈）、config\FSDTrainer.ini（重排自瞄段）
+【2026-09-19 12:3x · v52b（排版返工：自瞄独立页签 / 修平滑度无输入框 / 白圈常驻游戏里）】
+一、用户反馈的三条 + 处理
+  1) "排版太乱"：上一版把 52 个开关型功能并进数值列表 → 实际很难看（行高不一致、一排绿色"已开启"按钮）。
+     **返工**：恢复"数值列表 + 下面一块开关网格"的老排版；自瞄 6 项改成**独立页签「自瞄」**
+     （ini 里这 6 段的 `cat=常规` 改成 `cat=自瞄`，页签顺序变成 常规 → 自瞄 → 武器道具 → …）。
+     现在：常规页 = 原来的样子；自瞄页 = 数值区（自瞄范围 / 自瞄平滑度）+ 开关区（自瞄 / 隔墙瞄准 /
+     “镇魂机枪” / 显示范围），干净且一眼能看全。验证图 out\verify\aim_tab.png。
+  2) "自瞄平滑度没有输入框"：**真找到 bug 了** —— 上次用脚本往 ini 插自瞄段时，结尾漏了一个换行，
+     变成 `addr=0[feature.魔法子弹]` 一行。后果：① `[feature.自瞄平滑度]` 后面跟着 `kind=patch`、
+     `sealed=1`（那是"魔法子弹"的内容），于是平滑度被判定成"未实现/封印"→ 只画灰色名字、不给输入框；
+     ② `[feature.魔法子弹]` 整段被吞掉（功能数 97 而不是 98）。已修换行并全库扫了一遍（只有那一处），
+     现在功能数 98、平滑度有完整输入框。
+  3) "白圈要画在游戏里，关掉菜单就看不到"：DLL 逻辑本身没问题（离线验证：`menu_open=0` 时仍会画出白圈，
+     见 out\verify\aim_hud_nomenu.png），但菜单隐藏时只有"数据变化/需要清屏"才重画一次。
+     现在加了 **4Hz 心跳重画**（`Ui::aimDrawAt`，只在"显示范围"开着时），白圈当作常驻 HUD，不再被漏掉。
+二、改了哪些文件
+  · src\ui.cpp：① 数值列表恢复只放 value/slider；② 恢复"开关"网格；③ 白圈重画心跳；
+    （上一版加的"列表内 toggle 行"已删除）
+  · src\ui.h：新增 `aimDrawAt`
+  · config\FSDTrainer.ini：自瞄 6 段 `cat=自瞄`、修 `addr=0[feature.魔法子弹]` 换行、ini_ver=50→51
+  · loader\FSDTrainerLoader.cpp：改查 ini_ver=51
+三、验证
+  · 离线 UI 测试台：自瞄页签排版 OK（自瞄范围/平滑度 都有输入框+±+应用+恢复默认；4 个开关按钮）；
+    菜单关闭时只画白圈 + 锁定黄框。
+  · 游戏内：v52 引擎载入、ini 段数 98、features 默认全 0；异常 0 条。
+【2026-09-19 12:4x · v53（输入框规则 / 自瞄三个毛病 / 全灭+自瞄闪退）】
+一、输入框（用户要求：只能 ≥0、小数点后一位）
+  · ui.cpp 的 InputBox 增加 `dec1` 模式：只接受 0-9 与一个小数点，且小数点后最多一位（插进去后校验整串，
+    多于一位就不让进）；小数位规则是"按结果串判断"，所以可以删掉重输、可以 100→105 这种改。
+  · 数值框（功能页/冻结页/扫描页）都开了 dec1；补丁页的十六进制字节框保持原样（那本来就要 a-f）。
+  · 「－」按钮与「应用」/回车都会把值夹到 ≥0；数值显示统一改成一位小数（30.00 → 30.0）。
+二、自瞄三个毛病
+  1) "死的怪还瞄、不及时换目标"：
+     · 新增 `isDeadActor()`（读 bIsDead / Health.bIsDead / Health.CurrentHealth<=0 / bIsAlive，读不到就当活着）；
+     · 目标改成**每个 tick 复检**：valid → 死亡 → 距离超范围 → （需要时）可见性，任一不满足立即丢弃并把
+       重扫计时清零（下一 tick 就重扫），不再等 0.45 秒。
+  2) "瞄在胯下"：瞄准点改成敌人 `CapsuleComponent:K2_GetComponentLocation()` + 0.35×CapsuleHalfHeight（胸口），
+     拿不到胶囊才退回"原点+55cm"（原来固定 +25cm 太低）。
+  3) "隔着墙还被锁"：`aimVisible` 现在要过两道：`pc:LineOfSightTo(t,{0,0,0},false)` **且** `t:WasRecentlyRendered(0.25)`
+     （被挡住的怪不进渲染流程，LastRenderTime 会过期）。
+     ⚠️ WasRecentlyRendered 偏保守，可能偶尔漏掉"其实看得见"的怪；嫌太严就把「隔墙瞄准」打开。
+三、闪退（自瞄 + 怪物全灭 一起开）
+  根因：**每个 Pawn 实例都调 GetFullName**（`targets()` 和 `aimPick()` 都是）。C_KillAll 每秒清场，
+  怪正在被销毁时 GetFullName 会去读已释放的 FName —— 正是 v35 那个崩溃根因，重新踩了一次。
+  修法：新增 `clsInfo()` 类名缓存 —— 先 `p:GetClass()`（安全）拿类地址，按**类**缓存"名字 + 是不是敌人"，
+  实例只做地址比较；再也不对实例调 GetFullName。杀戮光环的"目标类名="日志也顺带变成每类只打一次。
+四、验证
+  · Lua 自检 / 分块 / luaparser 全过；DLL 编译通过。
+  · 离线 UI 测试台：out\verify\aim_tab_v53.png（30.0 / 0.0，一位小数）。
+  · 游戏内：v53 载入后异常 0 条；自瞄 + 怪物全灭 同时开着跑了一段没崩（太空站里只有 1 个目标）。
+  · ⚠️ 未验证：任务里的"跳过死怪/瞄胸口/不锁隔墙怪"这三条要真人打一局才知道，请用户实测。
+【2026-09-19 12:5x · v53b（修"开关点击后没有视觉反馈"）】
+  根因：开关型（ui=toggle）的"开/关"状态存在 DLL 的 `f.on` 里（Toggle() 翻的就是它，状态文件写的也是它），
+  而我上一轮为了修"ini def=1 的开关显示成关"把界面高亮改成了用 `f.cur != f.def` 判断 ——
+  可 `f.cur` 对开关型根本不会被改（改的是 f.on），于是点下去永远不高亮，看着像"没反应"。
+  修法：
+   ① src\patches.cpp 加载功能表时，对 `ui=toggle && kind=cheat` 用 `f.on = (def != 0)` 初始化
+      （这样 ini 里 def=1 的开关一进来就是"开"，界面/引擎一致）；
+   ② src\ui.cpp 开关网格的高亮改回 `f.on`（点一下 Toggle() 翻 f.on，25Hz 重画的菜单立刻变色）。
+  验证：离线 UI 测试台把「自瞄」「显示范围」默认值设成 1 → 两个开关按钮都是高亮琥珀色
+  （out\verify\toggle_hl.png，已开启 11/98）；编译通过，游戏内 v53 载入正常。
+【2026-09-19 13:4x · 监控用户的 DX11 修改器 + 崩溃责任划分 + v54 加固】
+一、监控对象/方式
+  · 用户此刻正在用他那个 DX11 修改器（`D:\SOMTOLS\DeepRockGalactic\26.8.25-New.dll`，12.2MB，VMProtect 壳，
+    用 `in\Xenos64.exe` 注入，只吃 DX11，INSERT/F6 开关菜单，卡密制）。
+  · 手段：进程/模块/线程/网络快照、目录文件变化对比、抽字符串、截图它菜单与游戏内 ESP（见 reference\dx11trainer）。
+二、结论（详细见 reference\dx11trainer\【分析】DX11修改器监控报告.md）
+  · **静态分析没用**：VMProtect 把字符串全加密了，抽出来 5 万条几乎全是乱码（只 1 条可读中文）。
+  · 抓到了它的菜单页（常规选项）和它在任务里的 ESP/HUD：
+    常规页=移速300(绝对值)/奔跑500/显示敌人范围34.9m/显示采集30m + 飞行模式/显示队友/队友骨骼/显示雷达/
+    无限跳跃/全图高亮 + 无敌模式/瞬间复活/解除抓捕/设置随机名字/启用喷气靴子/击杀所有敌人；
+    页签和我们一样是 常规/武器道具/钻机手/工程师/枪手/侦察兵/特殊功能。
+    ESP/HUD：敌人框带"距离/生命/护甲"、矿物名+距离、队友卡片(距离/生命/护甲/倒地提示)、雷达圆盘、
+    屏幕中心白色细圈（跟我们「显示范围」一个思路）、底部团队资源统计、Boss 血条。
+  · 它的菜单**鼠标一点就关**，所以没能翻到其他页签的完整列表（要看只能人工点或开它的语雀文档，密码 kq6o）。
+三、崩溃责任划分（今天 4 次，minidump/crash report 实测）
+  · 12:35:11 AV 读0x0（18 帧全在游戏本体，UE4SS 已注入）→ **我们的**
+  · 12:44:47 AV 读0x18，**RIP=UE4SS.dll+0x52DBB9** → **我们的**，就是 GetFullName/FName::ToString 读已释放对象
+  · 12:46:34 EXCEPTION_STACK_OVERFLOW，帧里是 `26_8_25_New` → **它的**（所以 12:47 用户又重注入了一次）
+  · 00:54:01 D3D device HUNG(0x887A0006) → 显卡设备挂死，跟两个修改器都无关
+四、v54 加固（已编译，还没注入——用户正在用他的 DX11 修改器，我没去动游戏进程）
+  · `entCache`：pawn 地址 → 是否敌人 + 类名。同一只怪只分类一次，之后每 tick 只 `valid()`+取坐标，
+    不再在"怪将死"的窗口里调 GetClass/GetFullName。
+  · 自瞄"贵检查"（死亡/距离/可见性/瞄点）限频 0.15s 一次；每 tick 只 valid + 一次坐标 + 写朝向；
+    瞄点高度差 aimOffZ 由贵检查刷新后缓存。
+  · 版本 v53→v54，Lua 自检/分块/DLL 编译全过。
+【2026-09-19 14:0x · v55（"全抄" DX11 修改器的 HUD：生命护甲/队友/雷达/解除抓捕/F6）】
+一、抄了什么（全部离线验证过绘制，游戏内待用户实机确认）
+  1) 敌人 ESP 标签加 **生命/护甲**：格式改成 `E x1 y1 x2 y2 距离 生命 护甲 名字`，
+     DLL 画成 `战士虫·攻击者 20m 生命14 甲25`（和新版 ini 一起生效，旧格式不再兼容）。
+  2) **显示队友**（原先是 kind=freeze 的占位，没实现）→ 改成真开关 `esp_team`：
+     引擎把队友 Pawn 以 `T ... 距离 生命 护甲 倒地 名字` 写进 ESP 文件，DLL 画绿框 + `☠ … 倒地`。
+  3) **显示雷达** → 真开关 `esp_radar`：引擎为 100m 内目标写 `R 方位角 距离 类型`，
+     DLL 在左下角画圆盘（红=敌人 青=矿物 绿=队友，白刻度=正前方）。
+  4) **解除抓捕** 新动作按钮（常规页）：`C_KillAll` + `C_KillAllNeutral`（被抓时清场即脱身）。
+  5) **F6** 也能开/关菜单（原来只有 INSERT）。
+  6) 生命/护甲的属性读取带 0.5s 缓存（`hpOf`），避免每帧狂读 Health/Shield。
+二、没抄的（报告里写明了原因）
+  · 队友骨骼：要逐骨骼/socket 读，帧内几十次 UFunction 调用风险高，且现在没法在游戏里验证。
+  · 资源统计：只做了探测（开雷达时日志会打印 `[资源探测] PlayerState 里像资源的属性: …`），
+    等有日志再定读取格式。
+  · 全图高亮 = 我们已有的「全亮/关雾」；移速/奔跑 = 我们用倍率，功能等价。
+三、工程改动
+  · src\cheat_engine.h：v54→v55；ESP 段拆成两块（第 4 块原本涨到 17.7KB 超 MSVC 16KB 限制，
+    现在 parts=7，最大 15943 字节）；新增 hpOf/resProbe/espRescan2/雷达行；ACT 表加 unjail。
+  · src\ui.cpp/.h：EspDot 加 hp/sh/倒地位；LoadEsp 解析新格式 + R 行；DrawEsp 画生命护甲文字、
+    队友绿框、左下角雷达盘；EspWanted 把 esp_team/esp_radar 也算进去；加 <cmath>。
+  · src\dllmain.cpp：热键线程加 F6。
+  · config\FSDTrainer.ini：显示队友/显示雷达 变真开关、新增解除抓捕；ini_ver=51→52
+    （loader 同步改），段数 98。
+四、验证
+  · Lua 自检/分块（7 块全 <16KB）/luaparser、DLL 编译 全过。
+  · 离线 UI 测试台伪造 ESP 文件渲染出 out\verify\esp_v55.png：红框敌人 + 生命/甲文字、绿框队友、
+    青框矿物、左下角雷达盘有 4 个彩色点。
+  · ⚠️ 完全没有在游戏里跑过（用户正在用他的 DX11 修改器玩，我按他要求没关游戏、没注入、没控制）。
+    实机注意事项：我们的 DLL 和他的 DLL 都会钩 Present，**别同时注入**。
+【2026-09-19 14:1x · v56/v57（镐子攻速换成动画速率 / 喷气靴多写法 / 修隔墙瞄准的隐蔽 nil bug）】
+一、镐子攻速（用户：设置后无效果，想要"攻速倍率"）
+  · 老做法 `cm:SetQuadPickAxe` + 一批猜的属性（MiningSpeedMultiplier 等）游戏都不认。
+  · v56 改成写角色骨骼网格的 **`Mesh.GlobalAnimRateScale`** = 挥镐动画速率倍率
+    （DRG 的挖矿/挥镐伤害由动画通知驱动，动画放快就等于攻速快）。属性名是 UE 标准属性，能读回验证。
+  · 实测（热载进用户正在跑的游戏）：日志 `[镐子] 动画速率(攻速) 原=1.0 写=1.00 读回=1.0 ✓生效`
+    —— 属性存在且可写；菜单里把「镐子攻速」调到 >1 就会真的变快（默认 1 = 原速）。
+  · 另外保留 SetQuadPickAxe（>1 时附带发一次），并保留属性的"探测"日志备用。
+二、装备喷气靴二代（用户：失效）
+  · v56 把 `C_JetBoots_Enable_MK2`、`C_JetBoots_Enable`、`C_JetBoots_Enable_MK2 1`、`C_JetBoots_Enable 1`
+    四种写法一次全发，再读回 `bHasJetBoots/bJetBootsEnabled/JetBoots/bJetBoots/bootsActive` 与 `MovementMode`。
+  · 目的：靠下一次的日志判断到底哪条命令/哪种属性有效（我这边现在没法在游戏里点菜单验证）。
+三、★修一个隐蔽 bug（v57）：隔墙瞄准开着时自瞄整个瘫掉
+  · 现象：`!!! 自瞄循环异常(已继续): attempt to call a nil value (global 'aimVisible')`（14:08 日志实测到）。
+  · 根因：v53 起 `aimPick` 里调用 `aimVisible`，但 `aimVisible` 是 `local function` 且定义在 `aimPick` **后面** ——
+    Lua 的 local 只对后面的代码可见，于是那个名字变成全局 nil；只要「隔墙瞄准」=开，aimPick 每 tick 抛错，
+    整个循环被 pcall 吞掉 → 目标再也不重扫/不切换 → 用户反馈的"隔着墙的怪还被锁住"正是这个。
+  · 修法：把 `aimVisible` 挪到 `aimPick` 前面，并写进交接文档的"Lua 坑"。
+四、部署方式（这次没法重编 exe）
+  · 用户正在玩，`out\FSDTrainer.dll` 被运行中的游戏占用 → 链接失败（LNK1104），所以我**没有关他的游戏**。
+  · 改用**热载**：把引擎脚本写进游戏目录 `FSDTrainer_code56.lua / _code57.lua`，再往 `FSDTrainer_cmd.txt`
+    写 `lua 文件名`，执行器 v7 会 load 执行 → 日志确认 `功能引擎 v57 已载入 gen=3`，异常 0 条。
+  · `out\Carlhand.exe` 目前仍是 v55 的包（等用户关游戏再重打包）。
+五、目录纪律
+  · 用户指出我在 work 根目录留了东西：是离线测试台 Dx12Test.exe 在"当前工作目录"生成了一个 fake.txt，
+    已删掉；以后所有产物只写在会话目录 `260918_143041` 里，测试台用 -WorkingDirectory 指定到 out\verify。
+  · `功能对照表.md` / `常规页功能可实现性.md` 之前被清成 0 字节，已从 `_github\Carlhand\` 快照恢复，
+    并把本会话的速度/自瞄改动（v49~v53 条目）重新补了回去。
+【2026-09-19 14:15 · v58（打包 v57 + 喷气靴走对路子）】
+一、用户关游戏后做的事
+  · 重新 `build\loader.bat` 打包：`out\Carlhand.exe` = v58（之前 v55 因为 DLL 被运行中的游戏占用编不了）。
+  · 清掉游戏目录里的热载临时脚本 `FSDTrainer_code56/57.lua`，cmd 文件置空。
+  · 重启游戏 + 注入做冒烟测试：`功能引擎 v58 已载入`、ini_ver=53、之后异常 0 条。游戏保持开着等他测。
+二、喷气靴（v58 改走正确入口）
+  · 从 Pawn 类链转储里翻到实证：
+      P JetBootsComponentSpawnable / JetBootsComponentMK2Spawnable [SoftClassProperty]
+      F Server_CheatJetBoots_MK2 / F Server_CheatJetBoots
+    → "发喷气靴"是**角色上的服务端函数**，所以光发控制台 `C_JetBoots_Enable_MK2` 经常没用。
+  · v58 的「装备喷气靴二代」现在依次尝试：
+      pawn:Server_CheatJetBoots_MK2() → pawn:Server_CheatJetBoots()
+      cm:Server_CheatJetBoots_MK2()   → cm:Server_CheatJetBoots()
+      再兜底发两条控制台命令；最后读回 bHasJetBoots/... 和 MovementMode 并打进日志。
+三、上一局的实测数据（用户自己点的）
+  · 镐子：`[镐子] 动画速率(攻速) 原=1.0 写=3.00 读回=3.0 ✓生效`（后来调回 1.00 ✓）→ 属性可写可读回，
+    GlobalAnimRateScale 这条路是通的，速度感由用户判定。
+  · 队友 ESP：`[ESP] 目标重扫: 0 个（敌人 0m / 矿物 0m / 队友 1m）` → 队友扫描确实抓到了 1 个队友。
+  · （之前 v57 的日志里 `attempt to call a nil value (global 'aimVisible')` 已随 v57 修掉，v58 之后 0 异常。）
+【2026-09-19 14:2x · v59/v60（喷气靴崩溃定位 + 两个"定义顺序"大坑）】
+一、点「装备喷气靴二代」崩溃（v59 修）
+  · 证据：crash_2026_09_19_06_18_17.dmp（14:18:18），正好是点按钮那一下；v58 的喷气靴处理器第一步就是
+    `pawn:Server_CheatJetBoots_MK2()`。
+  · 结论（新增一条铁律）：**绝对不要从 Lua 直呼 `Server_*` 前缀的 RPC** —— 那是带网络参数校验的服务端函数，
+    UE4SS 从 Lua 直呼参数对不上就抛 C++ 异常，pcall 接不住，直接死进程
+    （和之前 `fn(pawn,true)` 调 Server_SetRunning 崩的是同一类）。
+  · v59 起喷气靴只走安全路线：`C_JetBoots_Enable_MK2` / `C_JetBoots_Enable` / 各带 ` 1` 的变体，
+    再读回 bHasJetBoots 等状态。实测（我伪造 features 触发动作）：四条命令全部 `ok=true`，**不崩**。
+二、★★v60 修掉一个更隐蔽、影响面更大的坑：ACT 表里的 onFunc 全是"静默空转"
+  · 现象：点「呼叫补给仓」「解除抓捕」「装备喷气靴」都没反应，但日志只有一个 `[key] -> 1`，后面的命令一条都没有。
+  · 根因：ACT 表定义在 `cmd` / `getCM` / `mov` **之前**，而 Lua 的 `local function` 只对**后面**的代码可见 ——
+    闭包里引用的这些名字变成了**全局 nil**，`pcall(nil,...)` 静默失败、连错误都不报。
+    （喷气靴 v55 版本那行 `[喷气靴] 已启用（本局有效）` 之所以还能打出来，是因为 W 定义在 ACT 之前。）
+  · 修法：ACT 之前加 `local cmd, getCM, mov` 前置声明，定义处把 `local function xxx` 改成 `function xxx`（赋值）。
+  · 修复后实测（伪造 features 逐个触发）：
+      喷气靴 → 命令[C_JetBoots_Enable_MK2] ok=true / [C_JetBoots_Enable] / [带 1 的两种] 全 true
+      呼叫补给仓 → 命令[InstantDropResuppyPod] ok=true / [C_SpawnDropPodOnSelf] ok=true / [C_Resupply] ok=true
+      解除抓捕 → 命令[C_KillAll] ok=true / [C_KillAllNeutral] ok=true
+    异常 0 条，进程存活。
+三、默认关闭（用户要求 + 顺带修同类问题）
+  · 「怪物全灭」「飞行模式」「无敌+复活」以及另外 6 个 cheat+toggle 功能**本来没写 def=**，
+    而 ini 的默认 def 是 1 → 每次启动它们都是**开**的（这也是日志里怪物全灭从进游戏就狂刷的原因）。
+  · 已给这 9 个功能统一补上 `def=0`（编号：怪物全灭/飞行模式/无敌+复活/无限跳跃/显示雷达/显示队友/全亮关雾/夜视/霸体
+    其中 sealed 的几个即使写了也点不动）。ini_ver=53→54。
+四、产物与验证
+  · out\Carlhand.exe = v60（已重新打包、已注入并冒烟测试通过），游戏保持开着。
+  · 每次改动后都跑了：Lua 分块（9 块，最大 15296 字节 <16KB）/luaparser/DLL 编译 + 游戏内触发验证。
+  · ⚠️ 这次学到的第 2 条铁律已写进交接文档的坑清单：**新写 onFunc/闭包时，先确认它用到的函数都在前面声明过**。
+【2026-09-19 14:3x · v61（调试数据归高级页 + 喷气靴别再刷爆）】
+一、页签归类 + 高级功能默认关
+  · 「调试数据」不再当普通页签：它原先来自 ini 里 cat=调试数据 的功能段，现在被 UI 从普通分类里摘掉，
+    和「扫描」「冻结」一起放进"高级页"（设置 → 显示高级功能 打开才出现，顺序：扫描 / 冻结 / 调试数据）。
+  · `advanced=1` → **`advanced=0`**（默认关闭），ini_ver=54→55。
+  · 离线 UI 测试台验证：关着时页签 = 常规/自瞄/武器道具/钻机手/工程师/枪手/侦察兵/特殊功能/设置；
+    打开后多出 扫描/冻结/调试数据（out\verify\v61_adv_off.png、v61_adv_on.png）。
+二、喷气靴"点多了会崩"的根因（v61 修）
+  · v60 每次点击**一次发 4 条命令**（MK2 / Enable / 各带 1），而每条命令都会给角色 **spawn 一个喷气靴组件**——
+    连点几次就把角色的组件表刷爆 → 崩。这也是"多次点击后崩溃"的原因。
+  · v61：**每次点击只发一条**，用 jbTry 计数在四种写法间轮换，日志写明"第 N 次点击 → 只发 X"。
+    这样既不会刷爆，又能让你点几次就把每种写法试一遍，看日志就知道哪个真有效。
+  · 实测（伪造 features 连点两次）：第 1 次只发 C_JetBoots_Enable_MK2、第 2 次只发 C_JetBoots_Enable，
+    两条都 ok=true，**没崩**，异常 0 条。
+  · 关于"点击无效"：命令发出去了、游戏也回了 ok=true，但游戏没反应 → 说明这几条控制台命令在当前版本确实不干活。
+    下一步（等日志确认四种都不行再做）：走属性/组件路线——安全地读角色上的 JetBoots 组件（如
+    `JetBootsComponentMK2Spawnable` 对应的实例）或直接给角色 AddComponent，**绝不再碰 Server_* RPC**。
+三、产物
+  · out\Carlhand.exe = v61（已打包、已注入、已冒烟测试）；游戏保持开着。
+【2026-09-19 14:3x · v62（读用户 6 次点击的日志 → 喷气靴为什么"没反应"）】
+一、日志分析（用户在太空站点了 6 次）
+  · 四种写法轮了一遍：C_JetBoots_Enable_MK2 / C_JetBoots_Enable / C_JetBoots_Enable_MK2 1 / C_JetBoots_Enable 1，
+    每一次都只有一条命令，**全部 ok=true**，但 MovementMode 恒为 1、状态字段读不到。
+  · 关键是 v62 新加的判定：【CheatManager=无效】—— **太空站里 pc.CheatManager 不存在**，
+    C_xxx 这类作弊命令根本没人处理，而 Kismet 的 ExecuteConsoleCommand 只要"控制台收下了"就回 true。
+    ⇒ **ok=true 不能当"生效"的证据**，喷气靴必须在**任务里**测（这条也写进交接文档）。
+  · 另一个好消息：这次连点 6 次**没有崩**（v60 每次点发 4 条命令会把角色组件表刷爆，那才是崩溃根因，v61 已改）。
+二、v62 新增的诊断
+  · 点击时打印 `CheatManager=有效/无效（太空站里没有…）`；
+  · 一次性列出角色类链里带 Boot 的属性（只读反射）：
+      JetBootsComponentSpawnable(SoftClassProperty)、JetBootsComponentMK2Spawnable(SoftClassProperty)
+    —— 只有两个"要 spawn 的组件类"，**没有** bHasJetBoots 之类的状态位，所以读不到状态是正常的。
+三、下一步（等用户在任务里试过再说）
+  · 若任务里点命令能穿上：收工。
+  · 若任务里也无效：走"给角色 spawn JetBootsComponentMK2Spawnable"的组件路线
+    （用 StaticConstructObject + RegisterComponent，小步试、随时能退），**但绝不碰 Server_* RPC**。
+四、备注
+  · Lua 第 0 块已 16081 字节（MSVC 单字面量上限 16380）——下次往头部/ACT 表加东西前记得再拆一块。
+  · out\Carlhand.exe = v62，已打包注入，游戏开着；异常 0 条。
+【2026-09-19 14:4x · v62b（页签改名/删开关 + 喷气靴历史考古 + 参考 mod）】
+一、页签与开关（用户要求）
+  · 「自瞄」页签改名 **镇魂机枪**（ini 里这 5 段的 cat=自瞄 → cat=镇魂机枪；段名不变）。
+  · 删掉 `[feature.“镇魂机枪”]`（key=aim_auto）这个开关 —— 现在触发方式固定为"按住鼠标左键才锁"
+    （引擎里 aim_auto 缺省 = 0；用户最近一直用的就是这个）。要改成"一直自动锁"随时说。
+  · 验证：离线 UI 出图 out\verify\v62_tab.png —— 页签显示「镇魂机枪」，开关区只剩 自瞄 / 隔墙瞄准 / 显示范围。
+  · ini_ver 55→56；段数 98→97。
+二、喷气靴"以前没问题、现在没反应"的考古（用日志说话）
+  · 全量日志统计：`命令[C_JetBoots...]` 这行在 **v60 之前出现 0 次**，v60 之后 17 次。
+    也就是说：**以前那版根本没把命令发出去**，日志里那句"已启用（本局有效）"只是 W() 打印的文本
+    （v60 修的"ACT 闭包里 cmd 是 nil"就是原因）。所以"以前没问题"是观感，实际什么都没发。
+  · 我真正搞坏的只有一处：v58 我让它直呼 `pawn:Server_CheatJetBoots_MK2()` → **把游戏打崩**（14:18 dump），
+    v59 已改回只发控制台命令并加了"绝不直呼 Server_*"的铁律；v61 又改成"一次只点发一条命令"避免刷爆组件。
+  · 现在的真实状态：命令确实发出去了（ok=true），但**太空站里 CheatManager 无效 → 游戏不认**。
+    所以请在**任务里**再试；这也是 v62 新增的日志能直接告诉你的（`CheatManager=有效/无效`）。
+三、参考 mod（用户强调"尤为重要"，见 reference\mods\）
+  · 已列出用户装的 23 个 mod：其中 **「自动装备喷气靴」** 直接对应我们卡住的喷气靴（证明这条路可行），
+    `_SakuraMods_QuickReload`（射速/换弹）、`Brighter Objects`（亮度）、`CombinedResources`/`DynamicNitra`（资源）、
+    `SpawnMenu`（生成）、`CustomDifficulty`（难度）分别对得上我们其他功能。
+  · mod 内容都在 `FSD\Content\Paks\FSD-WindowsNoEditor_Mods.pak`（4.18MB）。我写了 tools\pak_extract.py 分析：
+    UE4.27 / pak v11、索引未加密、55 条目，但用的是 **IndexEncoding 新格式（文件名被编码）**，
+    简易解析器抓不到名字 → 要真解包得用 repak/UnrealPak 或 mint 的导出功能。
+  · 下一步（按性价比）：① 先任务里试喷气靴命令；② 不行就按 mod 的做法给角色挂 JetBoots 组件；
+    ③ 需要看某个 mod 的源码时，用 mint/mod.io 单独下载那个 mod（很多 DRG mod 是 Lua 源码，可直接读）。
+【2026-09-19 14:5x · v63（喷气靴走 CheatManager UFUNCTION + 新增「自动装备喷气靴」）】
+一、先摆事实：喷气靴到今天为止**从来没在任务里点过**
+  · 全量日志统计：`CheatManager=有效` 出现 **0 次**，而每次点喷气靴都写着
+    `CheatManager=无效（太空站里没有…）` → 用户所有点击都在**太空站**里。
+  · 太空站里 `pc.CheatManager` 是无效对象 → `C_xxx` 作弊命令没人处理，**点了必然没反应**。
+    （Kismet 的 ExecuteConsoleCommand 只要控制台"收下了"就回 ok=true，所以 ok=true 完全不能当生效证据。）
+二、v63 改动
+  1) 喷气靴优先走 **CheatManager 上的同名 UFUNCTION**：`cm:C_JetBoots_Enable_MK2()`（无参调用，安全；
+     266 条命令表里的名字就是 FSDCheatManager 的函数名）。控制台命令作为第二条路，仍然一次只发一条。
+  2) 新增开关 **「自动装备喷气靴」**（key=jetboots_auto，默认关）：进任务/重生 8 秒后自动发一次
+     （仿用户装的 mod「自动装备喷气靴」）——这样不用赌手点的时机，日志会写 `[喷气靴] 自动装备：…`。
+  3) ini_ver 56→57，段数 98（新增一段）。
+三、测试方法上的一个坑（记下来）
+  · 我在太空站里用"直接改 features 文件"的办法触发动作，这次**全部失效**：因为用户正在用鼠标，
+    DLL 的"左键状态"检测一变化就把 features 文件按内存里的值重写一遍，把我的修改秒回滚。
+    → 想用文件触发测试，必须确认用户没在点鼠标；否则只能用菜单点或走热载。
+四、mod.io 参考（用户给的主页 https://mod.io/g/drg/m）
+  · 找到对口的：**自动装备喷气靴 / Automatic Equipping Jet Boots**
+    https://mod.io/g/drg/m/automatic-equipping-jet-boots（用户装的就是它）、
+    Unlimited Deep Scan Jet Boots Usage、Cargo Crate/Lost Pack/Jet Boot 100% chance；
+    B站中文 100+ mod 分类推荐：https://www.bilibili.com/opus/1134644464598384678
+  · mod.io 页面直连被挡（fetch failed），要看说明得用浏览器。
+五、产物
+  · out\Carlhand.exe = v63（已打包、已注入）；Lua 拆成 10 块（最大 15060 字节）。
+【2026-09-19 14:5x · v64（又崩一次：禁止按名字直接调游戏函数）】
+一、事故与根因（我认）
+  · 用户"局内点装备喷气靴立刻崩溃"：dump = crash_2026_09_19_06_45_04.dmp（14:45:05），
+    日志停在 `[jetboots] -> 3`（进任务后那一下），后面没有任何 W 行 —— 说明崩在处理器**最前面**那句，
+    也就是 v63 新加的 `cm:C_JetBoots_Enable_MK2()`。minidump 里异常来自 KERNELBASE 的 RaiseException
+    （典型 C++ 异常），即 UE4SS 调这个函数时被抛异常、没人接住 → 进程死。
+  · 同类事故第 3 次了（v58 `Server_CheatJetBoots_MK2`、v61 前的 4 连发刷爆组件、这次 `cm:` 直呼）。
+    统一写成铁律：**只允许 ① 控制台命令 ② 属性读写 ③ 只读反射**，其余一律不做。
+二、v64 改动
+  · 删掉 `cm:C_JetBoots_Enable_MK2()` / `cm:C_JetBoots_Enable()` 直呼；喷气靴只剩控制台命令这一条路
+    （一次点击只发一条，轮换 4 种写法）；「自动装备喷气靴」的开关也改成只发控制台命令。
+  · 好处：**这是第一次能在任务里干净地测控制台命令**（之前要么在太空站没 CheatManager，要么在 cm: 那句先崩了）。
+三、产物
+  · out\Carlhand.exe = v64（已打包、已注入）；Lua 10 块，最大 15120 字节；异常 0 条。
+【2026-09-19 14:5x · v65（喷气靴崩溃真凶：游戏自带的 MK2 命令本身是坏的）】
+一、证据链（全部自己读日志/崩溃报告得出，没让用户发）
+  · 14:45 crash：v63 的 `cm:C_JetBoots_Enable_MK2()` → C++ 异常从 KERNELBASE 抛出 → 进程死。（我们的调用方式问题）
+  · 14:48 crash：v64 改成只发控制台 `C_JetBoots_Enable_MK2`（任务里）→ 仍然崩。三条硬证据：
+      ① dump 日志停在 `[jetboots] -> 3`，**连 `命令[...]` 那行都没打出来** —— 说明崩在 ExecuteConsoleCommand 内部；
+      ② UE 崩溃报告：`EXCEPTION_ACCESS_VIOLATION reading address 0x1c`，**模块直方图 9 帧全在 FSD-Win64-Shipping**
+         （不是 UE4SS，也不是我们的 Lua）；
+      ③ 同一个命令在太空站里发过很多次都没事 —— 因为那时没有 CheatManager，命令根本没执行。
+  · 结论：**`C_JetBoots_Enable_MK2` 这条游戏自带命令在当前版本里就是会崩的**（MK2 组件的生成路径坏了）。
+    这也解释了为什么用户那个 DX11 修改器的"启用喷气靴子"能正常用 —— 它走的是另一条路（基础版/组件）。
+二、v65 改动
+  · 永久停用 `C_JetBoots_Enable_MK2`（连 `C_JetBoots_Enable_MK2 0` 和"卸下喷气靴"里的那条一起去掉），
+    喷气靴按钮和「自动装备喷气靴」现在只发基础版 `C_JetBoots_Enable`（另一条代码路径、另一个组件类）。
+  · 日志写清楚：`[喷气靴] 只发 C_JetBoots_Enable（MK2 版会把游戏打崩，已停用）…`
+  · 交接文档新增铁律 11b：**有的控制台命令本身就是坏的**，`ok=true` 不能当生效证据，要看崩溃报告。
+三、产物
+  · out\Carlhand.exe = v65（已打包、已注入，`功能引擎 v65 已载入`，ini_ver=57）；Lua 10 块，最大 15068 字节。
+四、下一步
+  · 若基础版 `C_JetBoots_Enable` 也会崩 → 彻底放弃命令路线，改**纯属性路线**（只读写属性，不调任何游戏函数）。
+【2026-09-19 15:0x · v66 + mod 工具链（用户批评"现成的 mod 为什么不借鉴"）】
+一、先认账
+  · 之前我只列了 mod 名字，**没有真正去读 mod 的实现**，一直在自己试机制 —— 这点是我不对。
+二、现在的实际情况（会阻塞"读 mod"这件事）
+  · 已经装好 **repak（Python 版 UE pak 工具）**，并写好了三个工具：
+      `tools\pak_repak.py`（列/解包任意 DRG mod pak）、`tools\gvas_dump.py`（读 mod 的 Settings.sav）、
+      `tools\strings_dump.py`（抽字符串）。⇒ 只要 mod pak 在磁盘上，我一条命令就能把 mod 解出来读。
+  · **但磁盘上现在没有 mod pak**：`FSD\Content\Paks\FSD-WindowsNoEditor_Mods.pak` 今天 01:43 还在（4.18MB），
+    现在不见了；只剩下 `FSD\Saved\SaveGames\Mods\<mod名>\` 的设置文件。
+    ⇒ 说明游戏里 mods 目前是**未启用/未安装**状态（DRG 会在启用 mods 后重新生成这个合并 pak）。
+    没有它，任何"读 mod 源码"都无从下手（设置文件里只有一个 bool，读不出实现）。
+  · 我试过的其他路子：mod.io 网页直连被挡（fetch failed）、mod.io 本地缓存是空的、全盘搜也没有该 mod 的独立文件。
+三、v66（顺手把"你点了没反应"这个坑补掉）
+  · 日志显示你在**太空站**里点了 4 次喷气靴 —— 太空站没有 CheatManager，命令不可能生效。
+  · v66：**太空站点过就记下来（jbPending），进任务/重生后自动补发一次**，不用你再点、也不用你看时机。
+  · MK2 命令保持停用（它会让游戏崩，是游戏自己的问题）。
+四、需要用户配合的唯一一件事
+  · 游戏里 **Mod 菜单 → 启用 mods → 重启游戏**（让 `FSD-WindowsNoEditor_Mods.pak` 重新生成）。
+    之后我自己解包读「自动装备喷气靴」，照它的做法实现，不再自己猜。
+【2026-09-19 15:2x · v67（喷气靴照抄 mod：Server_CheatJetBoots 0 参数，实测不崩）】
+一、用户装了 mod → pak 回来了（15:02 重新生成）
+  · `FSD\Content\Paks\FSD-WindowsNoEditor_Mods.pak`（4.4MB，pak v11，索引未加密）里那个中文目录
+    就是用户装的喷气靴 mod：/Game/全房间喷气靴（喷气靴 / 喷气靴HUB / 喷气靴启用 / 喷气靴save / InitCave / InitSpacerig）。
+  · 用 repak 解包（新写 `tools\pak_jb.py`；顺手修了 `pak_repak.py` 里 `mount_point()` 的错误调用），
+    从 mod 蓝图名称表读到关键事实：**mod 是虚调用（按名字调）Server_CheatJetBoots / Server_CheatJetBoots_MK2**
+    ⇒「装备喷气靴」的正路就是角色上的这两个 RPC（比以前只发控制台命令靠谱）。
+  · 附带：自己写了 uasset 解析（名称表 = FString+4 字节哈希 / 导入表 / 导出表：`tools\ueasset_parse.py`、
+    `ueasset_exports.py`）。Kismet 字节码解码**没搞定**（`kismet_dis.py`：DRG 这套字节码 token 值和 UE4 标准表对不上，
+    只确认函数结尾固定 `04 0B 53`）→ 所以改成在游戏里用反射直接读签名。
+二、签名（游戏内反射实读，不是猜）
+  · `tools\probe_jb.lua` 热载后的输出：StaticFindObject("/Script/FSD.PlayerCharacter") 命中；
+      [F] Server_CheatJetBoots      参数0  []  flags=2231488  outer=PlayerCharacter
+      [F] Server_CheatJetBoots_MK2  参数0  []  flags=2231488  outer=PlayerCharacter
+  · flags 含 FUNC_Net（确是服务端 RPC），但**两个都是 0 参数** ⇒ 以前「Lua 传参对不上」的推断不成立；
+    真正崩的是 MK2 那条路（游戏自己代码里 AV 读 0x1c），以及带参数的 Server_* 调用（如 Server_SetRunning）。
+三、v67 改动（`src\cheat_engine.h`）
+  1) 喷气靴按钮 +「自动装备喷气靴」统一走 `pawn:Server_CheatJetBoots()`（基础版）；只在 CheatManager 有效时调，
+     加载中/没角色就记 `jbPending` 稍后补发；RPC 失败才兜底发 `C_JetBoots_Enable`。
+  2) MK2 永久停用（控制台命令与直呼都会崩，是游戏自身的 bug）。
+  3) 新增一次性只读反射，把两个 RPC 的签名打进日志（ForEachFunction + ForEachProperty）。
+  4) 修 bug：自动装备那句 `if valid(cm2)` 里的 cm2 是不存在的全局＝nil ⇒ 这段代码**从来没执行过**。
+  5) 修 bug：`gp()` 读不到属性时返回的是「0 个值」，`tostring(gp(...))` 直接抛
+     `bad argument #1 to 'tostring' (value expected)`，把整个 tick 废掉（角色没有 CharacterMovement 时每 40 tick 抛一次）
+     → 新增 `ts()` 兜底并全面替换。
+  6) ini：「装备喷气靴二代」改名「装备喷气靴」+ 两条 note 重写；`ini_ver 57→58`（`loader\FSDTrainerLoader.cpp` 同步）。
+四、实测（我自己起游戏 → 注入 → 在太空站里真调了一次）
+  · `>> 功能引擎 v67 已载入 15:21:59 gen=1`；**无 `主循环异常`**（ts 修复生效）；`状态: 走速=300.0 …` 正常。
+  · `[喷气靴] pawn:Server_CheatJetBoots() -> ok=true nil` + `CheatManager=有效；MovementMode=1` ⇒ **进程没崩**。
+  · 另外意外验证了 v67 的兜底：某一刻 CheatManager 读到无效 → 打印「先不调，之后自动补发」，没有硬发。
+  · **没做的验收**：任务里点一次看游戏里是否真能喷气（需要用户打一局；日志会写 ok=true / 兜底）。
+五、产物与新工具
+  · `out\FSDTrainer.dll` / `out\FSDTrainer.exe` / `out\Carlhand.exe` = v67（已打包；游戏目录已注入，游戏保持在太空站）。
+  · 新工具：`tools\pak_jb.py`、`tools\ueasset_parse.py`、`tools\ueasset_exports.py`、`tools\kismet_dis.py`、
+    `tools\jb_strings.py`、`tools\ini_v67.py`、`tools\probe_jb.lua`、`tools\probe_jb2.lua`；
+    解包产物在 `reference\mods\unpacked_jb\`（含 `strings.txt`、`dsl.txt`＝名称表+导入表转储）。
+  · ⚠ 坑：在 UE4SS 里对 **class 对象**做 `GetPropertyValue`、或对**软类指针**调 `ToString()`，
+    **会把 Lua 线程打死**（执行器心跳停、cmd 热载不再响应；进程不死）——反射只准用
+    ForEachFunction / ForEachProperty / GetFName():ToString() / GetFunctionFlags() / GetSuperStruct()。
+
+【2026-09-19 15:4x · v68（喷气靴真因：游戏自己的接口必崩；改走"游戏喷气靴箱子"的组件路线，实测挂上）】
+一、用户反馈：任务里点「装备喷气靴」崩了（我在他之后自己读日志/崩溃报告，没让他发）
+  · 日志最后一行就是 `[jetboots] -> 3`，**连 jbArm 里任何一行 W() 都没打出来**（说明崩在那次调用里）。
+  · 崩溃报告 `UE4CC-Windows-94630D2E…`：`EXCEPTION_ACCESS_VIOLATION reading address 0x1c`，
+    PCallStack 与 **14:45 那次 `cm:C_JetBoots_Enable_MK2()` 的 9 帧逐帧一致**
+    （0x22a7e64 / 0x38c2133 / 0x38beec6 / 0x38c5c29 / 0x1c37fab / 0x2f51462 / 0x2f523f3 / 0x1d98097 / 0x1d92561）。
+  · 结论（改了之前的判断）：**"给喷气靴"那条代码在本版游戏里就是坏的**——`Server_CheatJetBoots`（角色 RPC）与
+    `C_JetBoots_Enable_MK2`（控制台命令）殊途同归，不是参数/调用方式的问题。**永久停用，不再碰。**
+  · 附带修正：之前用 `ForEachProperty` 读 UFUNCTION 参数得到的"参数0"**不可靠**（UFunction 的参数在
+    UE4.25+ 是 ChildProperties，UE4SS 这个 API 读不到；`AddComponentByClass` 也被读成"参数0"）。
+二、换路：照抄游戏自己的喷气靴箱子（解包基础 pak 读到的做法）
+  · 基础 pak（2.4GB）里 `FSD/Content/GameElements/JetBoots/Blueprint/` 有 BP_JetBootsBox / BP_JetBootsMovement /
+    BP_JetBootsMovement_Infinite / UC_JetBoots 等；`BP_JetBootsBox` 的名称表里是
+    `AddComponentByClass` + `GetComponentByClass` + `JetBootComponent` + `HasEquipped`（`SE_JetBootsBox` 只在
+    Deep Scan 出现）⇒ **玩家穿喷气靴 = 对角色 `AddComponentByClass(BP_JetBootsMovement_C, false, T, false)`**。
+  · 新工具：`tools/pak_base_jetboots.py`（列基础 pak 里 JetBoot* 资产）、`tools/pak_base_jb_extract.py`（按名提取）。
+三、v68 改动（`src/cheat_engine.h`）
+  1) `jbArm`：彻底删掉 `Server_CheatJetBoots()` 与所有 `C_JetBoots_*` 调用；改成
+     `pawn:AddComponentByClass(cls,false,{Translation/Rotation/Scale3D},false)`；挂之前先查"角色身上有没有"
+     （`jbComps()`：按组件 Outer == 角色 比对 GetAddress），日志写明组件数变化 + 是否"已穿上 ✓"。
+  2) 「卸下喷气靴」改成销毁我们自己挂的组件（`K2_DestroyComponent` → 失败再 `DestroyComponent(true)`），
+     不再发那些无效/会崩的控制台命令。
+  3) 引擎版本号 → v68；其余（`jbSig` 只读反射、ts() 兜底）保留。
+四、实测（我自己起游戏注入、太空站里真挂真卸）
+  · 挂：`[喷气靴] AddComponentByClass -> ok=true 返回=BP_JetBootsMovement_C …BP_GunnerCharacter_C_2147477312.BP_JetBootsMovement_C_2147475934；
+    角色身上的喷气靴组件 0 → 1（场上共 1 个）（已穿上 ✓）` ——**进程不崩**（三局反复验证）。
+  · 卸：`K2_DestroyComponent=false / DestroyComponent=false` —— 没崩但也没销毁（次要功能，界面里本来就是 sealed，
+    下次可以试 `pawn:K2_DestroyComponent(comp)` 或 `RemoveInstanceComponent`）。
+  · **还没验证的**：挂上之后游戏里"能不能真喷"（手感/按键），要用户玩的时候判定。
+五、事故与补救（必须记下来）
+  · 我用 PowerShell 的 `Get-Content`+`Set-Content -Encoding UTF8` 改 `loader/FSDTrainerLoader.cpp` 的 ini_ver，
+    把整个文件的中文重新编码成了乱码（PS 5.1 默认按 ANSI 读 UTF-8）→ 连 `\n` 都被吃掉 → 编译报
+    "常量中有换行符"。已从 `_github/Carlhand/loader/FSDTrainerLoader.cpp` 快照恢复，再用 edit 工具改 `ini_ver=59`，
+    并用"新编 exe 的宽字符串集合 vs 旧 exe"逐个对比确认：**只剩预期差异**（ini_ver=59 与三条 note 文本）。
+    ⇒ 教训：**永远不要用 PowerShell 读写带中文的源码/ini**，用 `edit` 工具或 Python。
+六、ini / 打包
+  · 「装备喷气靴」「自动装备喷气靴」的 note 重写（说明走的是挂组件、游戏自带接口已永久停用）；`ini_ver 58→59`，
+    loader 检查值同步（59）。
+  · 产物：`out/FSDTrainer.dll` / `out/FSDTrainer.exe` / `out/Carlhand.exe` = v68（已打包，游戏里已注入，游戏保持在太空站）。
+
+【2026-09-19 16:0x · v70（真凶找到：喷气靴组件燃料是 0；挂 MK2/无限版 + 补燃料，已写好待部署）】
+一、用户反馈：v68 的按钮**不崩了但没穿上**，并且**要 MK2 版**。
+二、只读探针查出来的真相（三条探针，都是热载进他正在玩的游戏里跑的，没关他的游戏）
+  · 探针 v4（场上组件清单）：任务里那个角色身上其实**已经有一个 `BP_JetBootsMovement_Infinite_C`**
+    （+ 我 v68 挂的 `BP_JetBootsMovement_C`）——**组件在、但没用**；另外 `pawn.JetBootsComponentSpawnable` /
+    `JetBootsComponentMK2Spawnable` 在**实例**上读是安全的（返回 TSoftClassPtrUserdata，不像在 class 上读会把 Lua 线程打死）。
+  · 探针 v5（组件 API）：原生 `UJetBootsMovementComponent` 的函数/属性全拿到了：
+      函数：Server_SetOverheated / Server_SetIsUsing / Server_SetCurrentJetFuel / RemoveJetBoots、
+            OnJumpPressed / OnJumpReleased / OnPlayerCharacterHit / OnCameraModeChanged、GetIsUsing …
+      属性：**CurrentJetFuel(读出来是 0.0!)**、Settings、Character、isUsing、isFromTakeOff、overheated、
+            FootSocketName*/LFootAttachMeshComponent/RFootAttachMeshComponent（脚上挂点，说明组件自己初始化过了）
+      ⇒ 喷气靴是**按跳跃键触发**的（OnJumpPressed/OnJumpReleased），而**燃料为 0 时根本不工作**。
+  · 探针 v6（Settings 数据资产）：`GD_JetBoots_Infinite` = **MaxJetFuel=50 / JetFuelCost=12 / JetFuelRechargeRate=45 /
+    JetFuelRechargeDelay=0.5 / JetForce=2000 / MaxAirSpeedZ=1700**。
+      ⇒ 只要把 `CurrentJetFuel` 写到 50 就能喷；而且充能(45/s) > 消耗(12/s)，补一次基本就"无限用"了。
+  · 另：游戏里**没有独立的 MK2 蓝图**——MK2 = `BP_JetBootsMovement_Infinite`（`BP_JetBootsMovement` 的子类，
+    用 `GD_JetBoots_Infinite`），也就是上面那个已在角色身上的组件。
+三、v70 改动（`src/cheat_engine.h`）
+  · 装备入口改为：**优先挂 MK2/无限版** `BP_JetBootsMovement_Infinite_C`（已有就不重复挂），
+    然后**补满燃料**：读组件 `Settings.MaxJetFuel`（兜底 50）→ 写 `CurrentJetFuel`（**纯属性写入，不调任何游戏函数**），
+    日志打印 写入结果 + 读回值 + isUsing/overheated。
+  · `jbComps()` 现在同时扫基础版与无限版；新增 `hasKind(pawn,"Infinite")` 判断；`jbSig` 改成打印类链上带 Boot 的函数（诊断）。
+  · 版本号 → v70；ini note 改成"挂 MK2 组件 + 补满燃料"，`ini_ver 59→60`（loader 检查值同步）。
+四、部署情况（这次不能热载）
+  · 热载通道用不了：我给游戏跑探针时把**执行器 v7 的 Lua 线程**弄死了（心跳停在 16:00:14，之后 cmd 不再响应）；
+    DLL 又被运行中的游戏占用 → 不能在原目录编译。
+  · 改在**副本**里编译验证：`_build_v70\`（拷 build/src/loader/config 后跑 loader.bat，编译通过），
+    并把成品发布成**独立可执行**：`out\v70\Carlhand.exe`（内嵌 v70 DLL + ini_ver=60 + UE4SS；放子目录是为了
+    不让它去用同目录那个旧 FSDTrainer.dll）+ `out\v70\FSDTrainer_v70.dll`（备份）。
+  · 用户重启游戏后：直接跑 `out\v70\Carlhand.exe`（会自动启动游戏并注入 v70），进游戏**按一次「装备喷气靴」**即可。
+  · 关游戏后应该再把 `out\FSDTrainer.dll` / `out\FSDTrainer.exe` / `out\Carlhand.exe` 更新成 v70（现在被占用）。
+五、给接手者的两条坑
+  · **别拿探针在用户正在玩的时候乱跑**：v5/v6 那种"遍历一个类的所有属性并逐个读值"会把执行器线程弄死
+    （游戏不死、引擎主循环还活着，但 cmd 热载/心跳全停）。
+  · 想"从 Lua 直呼游戏函数"之前，先在组件/角色的**属性**里找状态（这次就是 `CurrentJetFuel=0` 一句话解决）。
+
+【2026-09-19 16:07 · v70 实测通过（我自己起游戏注入后真跑了一遍）】
+  · `>> 功能引擎 v70 已载入 16:07:07`；按按钮后日志：
+      `[喷气靴] 角色类链里带 Boot 的函数: Server_CheatJetBoots_MK2(flags=2231488), Server_CheatJetBoots(flags=2231488)`
+      `[喷气靴] 挂MK2/无限版组件 ok=true 返回=BP_JetBootsMovement_Infinite_C ...BP_GunnerCharacter_C_...`
+      `补燃料：JetBootsSettings /Game/.../GD_JetBoots_Infinite MaxJetFuel=50.0 → CurrentJetFuel 写入 ok=true 读回=50.0；
+       isUsing=false overheated=false`
+  · 进程不崩（2825MB 存活）；组件挂在角色身上、燃料 0 → 50 读回一致 ⇒ 机制齐了，等用户手感验收。
+  · 产物：`out\FSDTrainer.dll` / `out\FSDTrainer.exe` / `out\Carlhand.exe` = v70（已重新打包并注入）；
+    另外留了一份独立可执行 `out\v70\Carlhand.exe`（备用）。
+
+【2026-09-19 16:14 · v71（第三环：组件的 Character 属性是空的）】
+  · 用户重启游戏后（这次他自己开的新局，跑的就是 out\Carlhand.exe=v70）反馈"没有效果"。
+  · 我在他**正在玩**的时候用轻量探针实测（没关他游戏）：
+      采样 60 次：`isUsing=false fuel=50.0 overheated=false MM=3/1` —— 燃料是满的，但**按跳跃键 isUsing 一直 false**
+      ⇒ 输入根本没到组件上。
+      再把 `isUsing` 直接写 true：燃料**不消耗**、MovementMode 不变 ⇒ isUsing 只是状态位，不是推力开关。
+      接着读组件的 `Character` 属性：`GetAddress()=0、名字=nil` ⇒ **是空的**！
+        写入 `Character=当前角色` 后读回正常（addr 与角色一致），但当时角色站在地上（MM=1）观察不到推力。
+  · v71 改动（`jbArm`）：找到/挂上组件后，除了补 `CurrentJetFuel=MaxJetFuel`，还把
+      **`Character` 指向当前角色**（原来是空）+ 把 `isUsing` 清成 false；日志把两个属性都打印读回值。
+  · 部署方式：用户游戏正开着（且执行器这次活着）⇒ 走**热载**（`FSDTrainer_code71.lua` + cmd），
+      日志 `>> 功能引擎 v71 已载入 16:14:38 gen=2`，**不用他重启**。
+  · 待确认：这次在**空中按住跳跃键**是否就真能喷。若还不行 → 下一步两选一：
+      ① 组件改成"延迟完成"创建（AddComponentByClass 第 4 参=true → 先设 Character/燃料 → 再 FinishAddComponent），
+         让 BeginPlay 时 Character 已经是角色；
+      ② DLL 侧加"空格键状态"写进 features（照它现在写 lmb 的做法），引擎里据此调组件的
+         `OnJumpPressed()/OnJumpReleased()`（这两个是公开原生函数）。
+  · 注意：`out\Carlhand.exe` / `out\FSDTrainer.dll` 目前仍是 **v70**（编译要关游戏）；热载的引擎是 v71。
+
+【2026-09-19 16:20 · v73（真开关＝OnJumpPressed；改名「装备喷气靴mk2」；实测驱动生效）】
+一、用户反馈（关键情报）：**屏幕左边出现喷气靴燃料条了，但没有喷气靴效果** ⇒ 组件确实挂上并起了 HUD，
+   差的是"推力"这一环。
+二、实测定位（都在他正玩的局里、热载探针跑，没关他游戏）
+  · 采样：燃料 50、`isUsing=false` 恒定 —— 空中按跳跃键也**不会**变 true（我们运行时挂的组件**没接上游戏输入**）。
+  · 直呼 `comp:OnJumpPressed()`：
+      - 站在地上（MM=1）调 → 没反应；
+      - **在空中（MM=3）调 → `isUsing` 立刻变 true** ✓✓ 这就是缺的那一步；
+      再 `OnJumpReleased()` 收工。**进程没崩**。
+  · （`bPressedJump`/`bWasJumping` 这些属性在 250ms 采样里读不到"按住"状态，所以引擎没法自己判按键；
+     干脆由引擎**接管**：空中=OnJumpPressed、落地=OnJumpReleased。）
+三、v73 改动（`src/cheat_engine.h`）
+  1) 新增 **100ms 喷气靴驱动循环**：`_G.__FSDT_JB` 为真（=按过按钮）时，每 100ms 看角色移动模式，
+     空中(3/5) → 调 `comp:OnJumpPressed()`（进入"喷气中"），落地 → `comp:OnJumpReleased()`；
+     燃料低于 8 自动补到 50；组件引用每 2 秒重找一次（换图/重生不失效）。
+  2) `jbArm` 末尾置 `_G.__FSDT_JB=true`、`jetbootsOff` 里清掉并 `OnJumpReleased`。
+  3) **只动本地玩家自己的角色**（`ctx()` 取到的那一个 pawn），不碰任何别的玩家 ⇒ 满足"其他人不受影响"。
+  4) ini：`[feature.装备喷气靴]` → **`[feature.装备喷气靴mk2]`**，note 写明"只给自己即刻穿上 MK2"；
+     `ini_ver 60→61`（loader 检查值同步）。DLL 侧不读 ini_ver（只有 loader 读），所以**已直接把新 ini 拷进游戏目录**，
+     用户点一下菜单里的「重新载入 ini」就能看到新名字。
+四、实测（v73 热载后，我用空格键模拟跳跃）
+  · 日志连续出现：`[喷气靴] 空中：接管推力（OnJumpPressed ok=true 燃料=50.0 模式=3）` /
+    `[喷气靴] 落地：OnJumpReleased（燃料=50.0）` ⇒ 驱动循环按预期工作、进程不崩。
+  · 另外观察到移动模式出现 **6（MOVE_Custom）**——喷气靴自己的自定义移动模式，说明 `Settings.MaxCustomMovementSpeed` 那条路被激活了。
+  · **还差的**：用户自己感受"能不能飞/手感"（我这边读不到可靠的高度/速度属性：Velocity/RelativeLocation 读出来不是 table）。
+五、产物状态（重要）
+  · 引擎 = **v73**（已热载进他当前那局，立刻可用；改名为「装备喷气靴mk2」，菜单里「重新载入 ini」后显示）。
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe` 仍是 **v70**：编译要关游戏，等用户关掉后重编（只需 ~40 秒）。
+  · ⚠ Lua 第 1 块已 **14364 字节**（上限 16380）——下次再往 ACT/喷气靴那块加东西前先拆块。
+
+【2026-09-19 16:22 · v74（用户说"喷气靴写乱了，重写吧" → 整段重写）】
+一、先清干净
+  · 删掉了 v67~v73 一路试出来的所有残留：`jbComps` / `hasKind` / `jbSig`（类链反射） / `jbProbe` /
+    旧的"发控制台命令"卸下逻辑 / 重复的继承式挂载分支 —— 现在喷气靴只有**一份**实现，集中在
+    `src\cheat_engine.h` 的「喷气靴 MK2（v74 重写）」那一段；Lua 第 1 块从 14364 → **11178 字节**。
+二、重写后的实现（4 步，每步都有实测依据）
+  ① `jbAttach`：给**本地玩家的 Pawn** 挂 `BP_JetBootsMovement_Infinite`（= MK2/无限版；游戏里没有单独的 MK2 蓝图），
+     用**延迟完成创建**：`AddComponentByClass(cls,false,T,true)` → 先 `Character=pawn`、`CurrentJetFuel=50`
+     → 再 `FinishAddComponent(c,false,T)`。（普通创建时 Character 是空的，组件不工作 —— 实测过。）
+  ② `jbPrime`：`Character` 指向角色 + `CurrentJetFuel = Settings.MaxJetFuel`（默认 0，光挂上不会喷）。
+  ③ 100ms 驱动循环：空中(MM=3/5) → `c:OnJumpPressed()`；落地 → `c:OnJumpReleased()`；燃料<8 自动续满。
+     （依据：我们运行时挂的组件收不到游戏跳跃输入，但空中直呼 OnJumpPressed() 会让 `isUsing` 立刻变 true。）
+  ④ 只碰 `ctx()` 取到的本地 Pawn，不遍历/修改任何其他玩家 ⇒ "其他人不受影响"。
+  · 禁用项写死不再调用：`Server_CheatJetBoots` / `C_JetBoots_Enable_MK2`（本版必崩，AV 读 0x1c）。
+  · 函数名都换成语义清晰的：`jbMineOf / jbHasMK2 / jbPick / jbPrime / jbAttach / jbArm / jetbootsOff`。
+三、界面
+  · ini：`[feature.装备喷气靴]` → **`[feature.装备喷气靴mk2]`**（note 说明"只给自己即刻穿上"），`ini_ver 60→61`；
+    **已把新 ini 直接拷进游戏目录** → 菜单里点「重新载入 ini」立刻能看到新名字。
+四、部署
+  · 用户游戏还开着 ⇒ 引擎走**热载**：`>> 功能引擎 v74 已载入 16:22:53 gen=5`（立刻可用，不用重启）。
+  · 另外在副本里编好了 v74 成品：`out\v74\Carlhand.exe`（独立可用，内嵌 v74 DLL + ini_ver=61）。
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe`（主文件）仍是 v70：等用户关游戏后重编一次即可（~40 秒）。
+五、待验收
+  · 用户在菜单点「装备喷气靴mk2」→ 跳起来按住跳跃键 → 看能不能喷（日志会写"空中：开始喷 / 落地：停止喷"）。
+
+【2026-09-19 16:30 · v75（用户反馈两件事，都修了）】
+1. **「无限跳跃」开关不见了 —— 根因是 ini 里这一段缺了段头**
+  · 用户："无限跳跃按键丢失"。查 ini 发现：
+      `[feature.显示雷达]` 段写完之后，**直接接了第二个 feature 的字段**（cat/kind/ui/def/key=inf_jump/note/addr），
+      却没有 `[feature.无限跳跃]` 这行段头 ⇒ 界面上只出现一个开关，`inf_jump` 被"显示雷达"吞掉了。
+  · 这正是交接文档 §9 里那条坑：**用 PowerShell 拼 ini 会漏换行**，`addr=0[feature.xxx]` 会把下一段吞掉
+      （历史上某个 `tools\ini_*.py` 时代之前的改动留下的）。已用 Python 补回 `[feature.无限跳跃]`。
+  · 顺手做了自检：现在 **98 个 feature 段 = 98 个 cat= 块**（此前是 98 段 / 99 块，正是被吞的那个）。
+2. **删掉「自动装备喷气靴」开关**（用户："我没说要这个"）
+  · ini 里 `[feature.自动装备喷气靴]` 整段删除；引擎里对应的自动装备逻辑也删了。
+  · 保留唯一一个自动行为：**按钮是在"还没角色/加载中"时按的**（jbPending）→ 进游戏 8 秒后替他补上那一次。
+  · `ini_ver 61→62`，loader 检查值同步。
+3. 部署与验证
+  · 游戏这时被用户关掉了 ⇒ 直接**正式重编**：`out\FSDTrainer.dll` / `out\FSDTrainer.exe` / `out\Carlhand.exe` = v75，
+    并冒烟测试：`>> 功能引擎 v75 已载入 16:30:47 gen=1`；游戏目录 ini 已是 `ini_ver=62`、
+    含 `[feature.无限跳跃]`、不含「自动装备喷气靴」、段数 98。游戏保持开着。
+  · 引擎侧 v75 只删代码不加代码：Lua 第 1 块仍是 11178 字节。
+4. 备注
+  · 之前热载的 v74 里，驱动循环在用户局内按预期打印过 `[喷气靴] 空中：开始喷 / 落地：停止喷`（日志有），
+    但"手感"还没得到用户确认；v75 没有改喷气靴的这套逻辑，只删了那个开关。
+
+【2026-09-19 16:33 · v76（查 16:25 崩溃 → 喷气靴代码全面去掉 GetFullName）】
+一、16:25 那次崩溃真因（用户上一局中途崩过一次，我自己读 minidump 查的）
+  · `crash_2026_09_19_08_25_18.dmp`：`EXCEPTION_ACCESS_VIOLATION reading address 0x18`，
+    模块 = **UE4SS.dll+0x52DBB9** —— 正是交接文档里那条老崩因
+    （v54 的 12:44 崩溃同地址：**对已销毁对象调 GetFullName / FName::ToString**）。
+  · 我 v74/v75 的喷气靴代码在 100ms 驱动循环里用 `nm(c)`（=GetFullName）来判断"哪个是 MK2"并打日志
+    ⇒ 换图/组件被销毁时就会踩这颗雷。**这是我的锅，已改。**
+二、v76 改法（喷气靴那一整段现在**零 GetFullName**）
+  · 判断"哪种组件"只靠 `FindAllOf("BP_JetBootsMovement_Infinite_C"/"BP_JetBootsMovement_C")` 的**类名查询**
+    + 用 `GetAddress()` 比对外层是不是当前角色的（`jbMineOf` 现在返回 `{c=组件, inf=是不是无限版}`）。
+  · 日志里不再打印对象全名，改打 `MK2@0x…` 这种地址标签（`jbLabel`）；`jbPrime/jbAttach/jbArm` 同样。
+  · 校验依然只有 `valid()`（IsValid）+ `pcall`，且整段都在 pcall 里跑。
+三、部署
+  · 引擎 **v76 已热载**进用户当前那局：`>> 功能引擎 v76 已载入 16:33:33 gen=2`。
+  · 成品 exe 这次**没能重编**：刚要编的时候用户又把游戏开起来了 → `LNK1104 无法打开 out\FSDTrainer.dll`
+    （DLL 被占用）。`out\FSDTrainer.dll` / `out\Carlhand.exe` 目前是 **v75**（含"无限跳跃修好 + 删开关"，
+    但喷气靴那段还是 v75 的 GetFullName 写法）。**等下次游戏关掉要立刻重编成 v76。**
+· 此外（v75 已做的）：ini 补回 `[feature.无限跳跃]` 段头（原来被 `[feature.显示雷达]` 吞掉，界面看不到）、
+  删掉 `[feature.自动装备喷气靴]`、`ini_ver=62`；自检 98 段 = 98 个 cat= 块。
+
+【2026-09-19 16:39 · v77（喷气靴改成"按住空格才喷"；另写了武器/角色属性设计文档）】
+一、用户反馈："喷气靴mk2 怪怪的，只按一次空格他会喷很多次、一直飞"
+  · 原因：v74 的驱动循环是"离地就一直喷到落地"（我为了绕开"引擎读不到按键"这么设计的），手感不对。
+  · 正解：**按键状态从 DLL 拿**。dllmain 每帧探测 `GetAsyncKeyState(VK_SPACE)` →
+    `SetInputJump()` → 和 `lmb` 一套机制写进功能表（`jmp=0/1`）；引擎据此：
+      空中 + 按住空格 → `OnJumpPressed()`；**松开或落地 → `OnJumpReleased()`**。
+  · 改了 4 个文件：`src/patches.h`（声明）、`src/patches.cpp`（g_inputJump + 写 jmp）、
+    `src/dllmain.cpp`（空格探测）、`src/cheat_engine.h`（v77 驱动循环）。
+  · **兼容**：如果当前 DLL 还没有 jmp（还没重启），引擎退化成"每次离地只喷 0.8 秒（8 个 tick）"，
+    至少不会再一直飞；日志会提示一次。
+二、部署
+  · 引擎 **v77 已热载**进用户当前那局（`功能引擎 v77 已载入 16:39:17 gen=3`）→ 立刻就不会"一直飞"了。
+  · DLL 需要重启才能生效（游戏正开着，主目录 DLL 被占用编译不了）⇒ 在副本里编好并发布
+    **`out\v77\Carlhand.exe`**（+ `FSDTrainer_v77.dll`，内嵌 ini_ver=62）。用户重启后跑它即可。
+  · 主目录 `out\FSDTrainer.dll` / `out\Carlhand.exe` 目前还是 **v75**；等游戏关掉后要重编成 v77。
+三、用户给的 5 个参考 mod → 写了设计文档
+  · 新文档：**`武器与角色属性_可借鉴mod设计.md`**，逐个给了"目标 / DRG 里字段位置 / 我们怎么做 / 风险 / 优先级"：
+      All-in-One(弹药手雷+工具)、Adjustable Ammo、Kid Assist(血盾)、Host Tools(房主)、Better Digging(挖掘)；
+      并写了统一流程（先只读探针 → 再写属性/发命令 → 读回校验 → 记原值可回滚）与排期（P0 弹药/血盾/挖掘/工具）。
+  · 顺手查了本地 mods pak：现在 13 个 mod 目录、741 条目；其中 **`ammopercent`（= Adjustable Ammo）已装**，
+    资产是 `percent.uasset/.uexp` + `ammoprec` + `InitCave`（关卡钩子）→ 结构同喷气靴 mod。
+    （读它内部细节需要先修 `ueasset_parse.py`：这类老资产的头部带 5 条 CustomVersion，长度和喷气靴那批不同。）
+
+【2026-09-19 17:0x · v78/v79（弹匣容量 / 血盾上限 / 挖掘速度；喷气靴按住才喷已实测）】
+一、用户要求：实现「弹匣容量、血盾上限、挖掘速度」的修改 + 关闭游戏让我重编
+  · 游戏已由用户关闭 ⇒ 主目录正式重编：`out\FSDTrainer.dll` / `out\Carlhand.exe` = v78（含下面的功能）。
+  · 中间为了调字段名，我自己起了几局游戏做探针（都在日志里留了证据）。
+二、喷气靴（v77 的 DLL 改动）**实测通过**：
+  · 日志连续出现 `[喷气靴] 开始喷（按住空格，ok=true 燃料=50.0）` /
+    `[喷气靴] 停止喷（松开/落地，燃料=45.12）`，燃料真的在掉 ⇒ **按住空格才喷、松开就停**，用户抱怨的"一直飞"没了。
+三、三个新功能（都是"候选属性名 → 写值 → 读回 → 日志"的同一套路）
+  · **血量上限 hp_max** ✅ 实测生效：玩家角色身上**没有** `Health` 属性，真正的组件叫 **`HealthComponent`**；
+    写它上面的 `MaxHealth`：`110.0 → 500（写=true 读回=500.0）` 成功。
+  · **护盾上限 sh_max**：实测玩家身上没有 `Shield/ShieldComponent`；探针 dump 出盾其实在**同一个 `HealthComponent`** 上，
+    字段叫 **`MaxArmor`**（还有 `ArmorRegenCurve/ShieldRegenDelay/MaxHealth`）⇒ v79 改成写 `MaxArmor`（并尝试补满 `Armor/CurrentArmor`）。
+  · **挖掘速度 dig_speed** ✅ 挥镐动画速率生效：写 `Mesh.GlobalAnimRateScale`：`1.0 → 3（读回=3.0）`。
+    镐子本身的伤害/范围字段**还没找到**：角色身上没有 `Pickaxe/PickAxe/PickaxeItem/PickaxeActor/MiningTool` 这些属性
+    （下一步：探 `FindAllOf` 一个镐子基类，或从 Inventory/工具 Actor 入手）。
+  · **弹匣备弹倍率 ammo_mult** ⚠ **还没生效**：角色身上没有 `Inventory/Item/CurrentItem/EquippedItem/Weapon/WeaponManager`，
+    探针把 pawn 7 层父类里带 Ammo/Weapon/Item/Clip 的名字都列了，只有 `OnStartedUsingItem/bIsUsingItemPressed/CanUseItem`
+    这类输入相关名字 ⇒ 武器对象不在角色上。下一步方向：① `PlayerState`/HUD 上找；② 用 `FindAllOf` 试 DRG 的武器基类名
+    （如 `AmmoDrivenWeapon`/`FSDWeapon`/`Item`，注意"试不存在的类名"有风险，要小步来）。
+四、界面/配置
+  · 新增 4 个功能段（都在「特殊功能」页）：`血量上限 hp_max`、`护盾上限 sh_max`、`弹匣备弹倍率 ammo_mult`、`挖掘速度 dig_speed`；
+    都是 `ui=value`、`def=0`（0 = 不改）。`ini_ver 62→63`，loader 检查值同步。
+  · 自检：102 个 feature 段 = 102 个 `cat=` 块（没有段头被吞）。
+  · Lua 块：新代码把第 8 块顶到 17951 字节（>16380 上限）⇒ 用新写的 `tools\split_block.py` 自动拆成 11 块
+    （现最大 14922），`kCheatEngineLuaPartCount=11`。
+五、产物
+  · 主目录 `out\Carlhand.exe` / `FSDTrainer.dll` = **v78**（游戏当时已关，正式编好）；`ini_ver=63`。
+  · 之后又把护盾改成写 `MaxArmor`（v79），但游戏这时已被我重新起来做探针 ⇒ 主目录 DLL 被占用编不了，
+    于是编在副本里并发布 **`out\v79\Carlhand.exe`**（+`FSDTrainer_v79.dll`）；主目录那份等下次关游戏再更新。
+六、给你的接手提示
+  · 数值型功能的标准做法就写在这里：**候选属性名列表 + 写值 + 立刻读回 + 把"探测"到的名字写进日志**，
+    然后在下一轮把真名固化进候选列表（血/盾就是这么从 `Health`→`HealthComponent`→`MaxArmor` 迭代出来的）。
+  · `dumpNames()` 现在会沿**父类链最多 7 层**列属性名（只列名、不读值，很轻）；本次靠它定位了 `MaxArmor`。
+
+【2026-09-19 17:10 · v80（隔墙瞄准 → 只锁可见单位，默认开；主目录已重编 v80）】
+一、用户要求：「隔墙瞄准」改名为「**只锁可见单位**」+ **默认开启**
+  · 发现原来那个开关的**标签和代码是拧的**：ini 里写「隔墙瞄准（开=隔着墙也锁）」，
+    而引擎里是 `needLOS=(aim_wall>0)`（开=要求视线=只锁看得见的），ini 又给了 `def=0`。
+  · 现在统一成：段名 `[feature.只锁可见单位]`、**key=`aim_vis`**、**def=1（默认开）**、
+    note 写"开（默认）=只锁看得见的单位（视线+最近渲染判定）；关=隔着墙也能锁"。
+  · 引擎：`needLOS=((tonumber(F.aim_vis) or tonumber(F.aim_wall) or 1)>0)`（兼容老功能表；两个 key 都没有时按新默认=只锁可见）。
+  · `ini_ver 63→64`，loader 检查值同步 64。
+二、部署（用户已关游戏，所以是主目录正式重编）
+  · `out\FSDTrainer.dll` / `out\FSDTrainer.exe` / `out\Carlhand.exe` = **v80**；
+    冒烟测试：`>> 功能引擎 v80 已载入 17:10:46 gen=1`；游戏目录 ini 已是 `ini_ver=64`、
+    含 `[feature.只锁可见单位]`、不再有「隔墙瞄准」、段数 102。
+  · 功能表里实测默认值：`aim_vis=1`（默认开 ✓）、`hp_max/sh_max/dig_speed=0`（默认不改 ✓）。
+  · 这一版还带上了 v78/v79 的：血量上限（HealthComponent.MaxHealth）、护盾上限（同一个组件的 MaxArmor）、
+    弹匣备弹倍率（⚠ 还没找到武器对象，见 17:0x 那条）、挖掘速度（Mesh.GlobalAnimRateScale）、
+    以及喷气靴的「按住空格才喷」（DLL 写 jmp）。
+三、产物现状
+  · 主目录 = v80（最新，含全部改动）；`out\v79\Carlhand.exe` 是上一版（可留作回退）。
+
+【2026-09-19 17:24 · v81（封印补给仓 / 血盾持续重写 / 挖掘改走控制台）】
+一、用户反馈（三条，都处理了）
+1. **「呼叫补给仓」点了崩游戏** ⇒
+   · minidump 实证：`EXCEPTION_ACCESS_VIOLATION`，模块 **VCRUNTIME140.dll**，params `0x1,0x10`
+     —— 元凶就是 ACT 里那句**直呼游戏函数** `cm:InstantDropResuppyPod()`（我们自己的铁律第 1 条又应验一次）。
+   · v81 把补给仓里"直呼游戏函数"的部分**全部删掉**，只保留**控制台命令 `C_Resupply`**；
+     ini 里该段改名 **`[feature.呼叫补给仓(已封印)]`** + `sealed=1` + note 写明原因。
+   · 顺带把「镐子」里同类的 `cm:SetQuadPickAxe()` 也删了（改成只发控制台 `SetQuadPickAxe`）。
+2. **血/盾上限写了没效果（HUD 依旧 125 / 30）** ⇒ 找出真正原因：
+   · 日志显示我们确实写进去了（`MaxHealth：110.0 → 600 读回=600`、`MaxArmor：25.0 → 600`），
+     但**游戏马上把它改回**（下一次又是 110/25）——所以只是"写一下、立刻被覆盖"。
+   · v81 改成**持续重写**：在主循环（300ms）之外，又加进 100ms 的小循环里每 100ms 重写一次
+     （`health 组件的 MaxHealth` + `MaxArmor`），日志会写"一直被游戏改回 → 继续持续重写"。
+   · 注：真正的"上限来源"可能是玩家的护甲升级数据（每帧重算）；如果 HUD 还是不变，
+     下一步要去改**升级数据/玩家存档侧**的字段，而不是组件属性。
+3. **镐子挖掘速度依旧原版** ⇒
+   · 实测结论：`Mesh.GlobalAnimRateScale`（挥镐动画速率）**只影响动画**，挖穿石头的速度不变
+     ⇒ 这个字段不是挖掘速度。
+   · v81：「挖掘速度>1」时改发**游戏自带**的控制台命令 **`SetQuadPickAxe`**（四倍镐）+ 仍写动画速率；
+     并保留"镐子对象上的伤害/范围候选"（角色上没有 Pickaxe 属性 → 目前走不到那一支）。
+   · 若这条也没用，下一步方向：从"石头/地形破坏"侧找（Carve/岩石血量），或解 `Better Digging` mod 的资产看它改了什么。
+二、部署
+  · 用户已关游戏 ⇒ 主目录正式重编：`out\FSDTrainer.dll` / `out\Carlhand.exe` = **v81**；`ini_ver=65`（loader 同步）。
+  · 冒烟测试：`>> 功能引擎 v81 已载入 17:23:33 gen=1`；给 hp_max/sh_max=600 后日志：
+    `MaxHealth：110.0 → 600（写=true 读回=600）` / `MaxArmor：25.0 → 600`，随后"一直被游戏改回 → 继续持续重写" ✓ 行为符合预期。
+  · 游戏保持开着（已注入 v81），用户可直接验收。
+三、给接手者
+  · 数值型"改了没效果"时，先看日志是不是**游戏马上改回**（本次血/盾就是）→ 解法是**持续重写**（100ms 更快）。
+  · **任何"点一下崩"的功能，先看 minidump 的模块**：VCRUNTIME140 / KERNELBASE = C++ 异常，八成是直呼游戏函数；
+    改用控制台命令几乎总能躲开（本次补给仓、镐子都这么改的）。
+
+【2026-09-19 17:5x · v82~v85（恢复补给仓 / 找到"真正生效"的字段）】
+一、用户三条反馈的处理
+1. **恢复「呼叫补给仓」** ✅：ini 段名改回 `[feature.呼叫补给仓]`、去掉 `sealed=1`；
+   引擎里改成**只发控制台** `C_Resupply` + `C_SpawnDropPodOnSelf`（不再直呼 `cm:InstantDropResuppyPod()`，
+   那个是上次崩溃的元凶：VCRUNTIME140 AV）。`ini_ver=66`。
+2. **血/盾上限还是 125/30** ⇒ 查明：我们写进去的 `HealthComponent.MaxHealth / MaxArmor`
+   **每帧都被游戏改回**（实测 110→600 写成功、下一帧又回 110；护盾 25→600 → 回 25）。
+   v81 起改成 **100ms 持续重写**（日志会写"一直被游戏改回 → 继续持续重写"）。
+   探针把 `HealthComponent` 的全部相关字段列了出来（35 条），关键几条：
+     `MaxHealth / MaxArmor / ArmorDamage / ReviveHealthReturnRatio / ReviveArmorReturnRatio /
+      HealthPerCrystalVolume / HealthRegeneration / ArmorRegenCurve / SubHealthComponents /
+      HealthSegmentSizes / DamageTakenMutator / SharedHealthMutator / canTakeDamage …`
+   ⇒ 没有 `CurrentHealth/CurrentArmor/Bonus` 这种字段；上限看起来是**游戏按护甲升级重算**的。
+   **下一步**：① 让用户在**任务里**看（太空站里的数值和任务里不同）；② 若还是不变，就查
+     `SubHealthComponents`（分段血量）/ 护甲升级数据侧，而不是组件属性。
+3. **挖掘速度没变** ⇒ 这次**找对了字段**（探针实测拿到镐子对象 `WPN_Pickaxe_Gunner_C`）：
+   · `FindAllOf("PickaxeItem")`（或 `"Item"`）就能拿到镐子对象（角色属性里**没有** Pickaxe 属性，之前找错了地方）。
+   · 镐子上的真字段：`QuadDamageCarving`（游戏自带"四倍挖掘"）、`MiningRange`、`DamageRadius`、`DamageRange`、
+     `QMiningReducedPlayRatePct`、`CooldownRate`、`DamageComponent`/`SpecialDamageComponent`。
+   · `DamageComponent` 上的真字段：`Damage`、`RadialDamage`、`DamageRadius`、`MaxDamageRadius`、
+     `armorDamageMultiplier`、`WeakpointDamageMultiplier`、`DamageBonuses`、`DamageModifiers`…
+   · v85 实测写入（读回全部一致）：
+       `QuadDamageCarving=false → true`
+       `MiningRange 300 → 900`、`DamageRadius 50 → 150`、`DamageRange 200 → 600`
+       `伤害组件.Damage 10 → 30`、`RadialDamage 15 → 45`、`DamageRadius 80 → 240`、`MaxDamageRadius 60 → 180`
+       （另附赠挥镐动画速率 ×3）。**这些才是"挖得更快/更大"的真字段。**
+二、副产品（留给下一步）
+  · 弹匣容量（ammo_mult）**仍没落地**：`FindAllOf` 试过 `Item/AmmoDrivenWeapon/FSDWeapon/AWeapon/Weapon/Gun/
+    AmmoDrivenItem/ItemWeapon`，只有 `Item`/`PickaxeItem` 命中（就是镐子）⇒ 手上武器不在这几个类名下。
+    下一步：进任务里再探（或在 `DamageComponent` 同级的"武器组件/物品栏组件"上找）。
+  · 新增探测函数 `probeExtras(pawn)`：每个**真角色**只跑一次，把"升级/护甲"属性名、`HealthComponent` 宽关键字、
+    镐子对象与镐子/DamageComponent 属性名、以及一批 `FindAllOf` 类名试探全写进日志 —— 以后找字段先看它。
+三、工程注意（这次又踩了同一个坑两次）
+  · 100ms 循环里引用了**后面才声明的 local**（`jbDumpFlags`、`clsOf`）⇒ 每 tick 抛
+    `attempt to index a nil value (global 'jbDumpFlags')`。**修法：这些改成全局函数/表**（`function clsOf`、
+    `jbDumpFlags = jbDumpFlags or {}`）。再次印证：**循环里用到的名字必须在前面的作用域可见**。
+  · 新代码把 Lua 第 8 块顶到 17125 字节（超 16380）⇒ 又跑了一次 `tools/split_block.py`，现在 **12 块**，
+    最大 15278。
+四、产物
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe` = 最新（v85 逻辑，版本串仍打 v82）；
+    `ini_ver=66`；游戏保持开着（已注入最新）。
+
+【2026-09-19 18:08 · v86（补给仓永久封印 / 挖掘改持续重写 / 血盾问题定位）】
+一、用户三条反馈
+1. **点「呼叫补给仓」修改器崩溃** ⇒ 查证：DLL 日志 `功能[呼叫补给仓] 已触发（第 2 次）` 18:04:23，
+   引擎日志只有 `命令[C_Resupply] ok=true`，紧接着 `crash_2026_09_19_10_04_23.dmp`（18:04:24）
+   —— **连控制台 `C_Resupply` 都会崩**（上一次崩的是直呼 `cm:InstantDropResuppyPod()`）。
+   三条路都试过（直呼游戏函数 / 控制台 C_Resupply / C_SpawnDropPodOnSelf）⇒ **v86 永久封印**：
+   引擎里该动作只写一行日志不再发任何东西；ini 里加回 `sealed=1`（点不动）+ note 写明原因。`ini_ver=67`。
+2. **挖掘速度改了没效果** ⇒ 原因与血/盾同源：**写一次会被游戏重算/改回**。
+   v86 把「挖掘速度」也搬进 **100ms 持续重写**（镐子 `QuadDamageCarving/MiningRange/DamageRadius/DamageRange`
+   + `DamageComponent.Damage/RadialDamage/DamageRadius/MaxDamageRadius` + 挥镐动画速率）。
+3. **血/盾上限改了会变回默认**（用户要求：剖析参考 mod 是怎么实现的）⇒ 事实与结论：
+   · **参考 mod 大多没装**：本地 mods pak 里只有 `ammopercent`（= Adjustable Ammo）属于用户给的那 5 个；
+     Kid Assist / All-in-One / Host Tools / Better Digging **都不在本地**，所以我读不到它们的实现。
+   · **能读到的同类参考是已装的 `CustomDifficulty`**（`Saved/SaveGames/Mods/CustomDifficulty.sav`，GVAS 可直接读）：
+     它的做法是**把一整套难度参数写成 JSON 存进存档**，字段就是游戏难度数据资产上的字段：
+     `MaxActiveSwarmers / MaxActiveEnemies / ResupplyCost / StartingNitra / EnemyCountModifier /
+      EnemyWaveInterval / FriendlyFireModifier / HealthRegenerationMax / ReviveHealthRatio / EscortMule{...}`
+     ⇒ **参考 mod 的通用套路 = 改"数据资产/难度配置"这类源头字段，而不是每帧去改组件的运行时属性**。
+   · 我们血/盾为什么改不动：实测 `HealthComponent.MaxHealth=110 / MaxArmor=25`，
+     而 HUD 显示 125/30（差额来自护甲升级）⇒ 游戏**每帧按升级重算并写回**这两个字段；
+     我们 100ms 写一次，游戏 ~16ms 写一次 ⇒ HUD 读到的基本都是游戏的值（我们只赢一小部分帧）。
+   · 下一步（可选三条路，按性价比）：
+     ① **最快**：改成 30ms 循环 + 只写不读（抢帧），HUD 会闪但多数帧是我们要的值；
+     ② **最正确**：找到"护甲升级/玩家数据"侧的上限来源（`SubHealthComponents`、`HealthSegmentSizes`、
+        或护甲升级资产），改源头；
+     ③ **最省事**：改成组件级无敌（探针里已看到 `canTakeDamage` 布尔 + `DamageTakenMutator`），
+        配合菜单里已有的「无敌+复活」（控制台 C_GodMode）——效果上等价于"打不死"。
+二、部署
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe` = v86；`ini_ver=67`；游戏已注入（`功能引擎 v86 已载入 18:08:28`）。
+
+【2026-09-19 18:20 · v87（补给仓已删除；按参考 mod 剖析结果重做"挖掘速度"）】
+一、用户要求与处理
+1. **删除「呼叫补给仓」** ✅：ini 里整段删掉（现在 101 个 feature 段，`ini_ver=68`）；引擎里只剩一个
+   只写日志的空节点（历史：直呼 `cm:InstantDropResuppyPod()` 崩一次、控制台 `C_Resupply` 又崩一次，
+   2 个 dump 实证）。
+2. **剖析用户装的参考 mod**（新写了 `tools/pak_mods_analyze.py` + `tools/mod_parse2.py`，
+   后者用"头部 CustomVersion 条数 + TotalHeaderSize + PackageName"定位名称表，能读这类资产的名称/导入表）：
+   · **Better Digging RT3**：选项 = `DigSize`(滑块) + `DigTerrain`/`DigMinerals`/`OneHitTerrain`/`OneHitMinerals` + 重置
+     （存档 `SG_BetterDigging` 里就是这几个字段；界面 `W_BetterDiggingPage` 有 `DigSlider` + 4 个 CheckBox）。
+     **机制 = patch 地形材质**：`AsyncLoadPrimaryAssetList/GetPrimaryAssetIdList/GetObjectFromPrimaryAssetId`
+     → cast `Terrain_Material` → `PatchMaterials/PatchOne`，改材质参数 **`DigSize`** 与 **`HitsNeededToMine`**
+     （另有 `BaseDig/BaseHits/Scratch*/RestoreBases` 存原值）。**不是改镐子伤害、也不是动画速率**。
+     ⇒ v87：我们遍历运行时 `MaterialInstanceDynamic` 设 `DigSize`/`HitsNeededToMine`（100ms 重写），
+       并保留镐子伤害/半径 + `QuadDamageCarving`（双保险）。**必须在任务里验**（太空站没有地形）。
+   · **HealthAndShieldNumbers**（用户以为它是 300 血盾那个）：**它只是 HUD 数字**！
+     `ReceiveTick` → `GetLocalPlayerCharacter/PlayerController/GameState` → `HealthComponent/PlayerHealthComponent`
+     → `GetHealth/GetArmor/MaxHealth/MaxArmor` → Widget 显示。**一个数值都不改**。
+     ⇒ 所以本地其实没有「Kid Assist 300 Health/Shield」；也解释了 HUD 一直 125/30（显示的就是游戏的值）。
+   · **Adjustable Ammo（ammopercent）**：`percent` + `ammoprec` + `InitCave`，无设置存档 ⇒ "BP 起来就改武器数据"
+     的做法；但武器对象在我们的 `FindAllOf` 里没找到（只有镐子），下一步要进任务探或读 `percent` 的字节码。
+   · 分析文档：`reference/mods/【分析】BetterDigging与血盾数字mod.md`（含"可做的高度自定义清单"）。
+二、部署
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe` = v87；`ini_ver=68`（游戏目录已同步，段数 101）；
+    冒烟：`>> 功能引擎 v87 已载入 18:20:13`；游戏保持开着。
+三、待办
+  · 挖掘速度：任务里验证（若仍无效 → 按 PrimaryAssetId 找地形材质**资产** patch，照 mod 一比一复刻）。
+  · 血/盾上限：请用户把真正的「Kid Assist 300 Health/Shield」装上，我照它扒实现（本地目前没有）。
+  · 弹匣容量：武器对象定位（进任务探 / 读 `percent` 字节码）。
+
+【2026-09-19 18:50 · v88（挖掘崩溃修复 / 武器类名找到 / 弹药与投掷物进入实现阶段）】
+一、**挖掘速度导致崩溃 → 已修**（v88）
+  · 原因是我 v87 的实现太猛：把**所有** `MaterialInstanceDynamic`（可能几百个）每 100ms 都调一次
+    `SetScalarParameterValue`（100ms × 400 个 = 每秒 4000 次游戏函数调用）→ 用户实测崩溃。
+  · v88：改成 **只做一次**、最多前 50 个、每个都 pcall（`mod Better Digging` 也是一次性 patch；
+    材质参数不会被游戏每帧重算）。镐子伤害/半径那几条保持 100ms 持续重写（它们不崩）。
+二、**武器类名拿到了**（基础 pak 实测，写进 `reference/mods/base_weapons.txt`）
+  · `WPN_AssaultRifle / WPN_Autocannon / WPN_BurstPistol / WPN_ChargeBlaster / WPN_CoilGun / WPN_CombatShotgun /
+     WPN_Crossbow / WPN_Cryospray / WPN_DoubleDrills / WPN_DualMPs / WPN_FlameThrower / WPN_FlareGun / WPN_Gatling /
+     WPN_GooCannon / WPN_GrapplingGun / WPN_GrenadeLauncher / WPN_HeavyParticleCannon / WPN_LaserPistol /
+     WPN_LaserPointer / WPN_LineCutter / WPN_LockOnRifle / WPN_M1000 / WPN_MicroMissileLauncher / WPN_MicrowaveGun /
+     WPN_Pickaxe* / …`（共 76 个候选）+ 投掷物 `BP_Grenade_* / BP_FlareJugge_S05 / BP_Throwable_* / WPN_FlareGun`。
+  · v88 的「弹匣备弹倍率」已经按这张表逐个 `FindAllOf(<类名>_C)`，找到就把
+    `AmmoCount/MaxAmmo/ClipSize/MaxClipSize/ReserveAmmo/MaxReserveAmmo/CarriedAmmo/Amount/MaxAmount/Count…`
+    按倍率放大（记原值），找不到就 dump 属性名。
+  · 太空站实测：只找到 **镐子**（`WPN_Pickaxe_Gunner_C`），**没有枪** ⇒ 武器可能只在任务里 spawn（或类名要用完整 76 个）。
+    **下一步**：用户进任务点一次「弹匣备弹倍率」，我读日志即可拿到武器对象 + 它的弹药字段真名，然后固化。
+三、血/盾（用户结论：Kid Assist 那个 mod 也做不到 → 他要删掉）
+  · 我们已确认：`HealthAndShieldNumbers`（= 他装的 Kid Assist）只显示数字；游戏每帧重算 `MaxHealth/MaxArmor`，
+    我们的 100ms 重写赢不了。**若要继续做**，两条路：① 30ms 抢帧（会闪）；② 组件级 `canTakeDamage=false` 无敌。
+四、产物
+  · `out\Carlhand.exe` / `out\FSDTrainer.dll` = v88；游戏已注入（`功能引擎 v88 已载入 18:50:00`）。
+  · 新工具：`tools/pak_base_weapons.py`（列武器/投掷物资产）、`tools/pak_mods_analyze.py` + `tools/mod_parse2.py`
+    （解包并读任意 mod 的名称/导入表 —— 这次能读了，因为按"头部 CustomVersion 条数"定位名称表）。
+
+【2026-09-19 19:10 · v90（删镐子攻速 / 黑掉挖掘速度 / 弹药改精确值 / 夜视解封）】
+一、用户四条要求
+1. **删除「镐子攻速」** ✅：ini 里整段删除；引擎里 `applyGroup(PICK_CANDS,F.pickaxe_speed,…)` 与
+   `SetQuadPickAxe` 那段都不再执行（同时也就不会再发那条控制台命令）。
+2. **弹药改成"精确可调"** ✅（用户：倍率 2 确实让子弹变了，但不可控）：
+   删掉「弹匣备弹倍率」，新增两个精确值功能：
+     · 「**弹匣容量**」`key=clip_size`（unit=发，0=不改）→ 写 `ClipSize/MaxClipSize/MagazineSize/MaxMagazineSize`
+       + 当前值 `AmmoCount/ClipCount/Ammo/CurrentAmmo/ClipAmmo`（连当前弹药一起补满）
+     · 「**备弹容量**」`key=reserve_ammo` → 写 `ReserveAmmo/MaxReserveAmmo/CarriedAmmo/MaxCarriedAmmo/BackupAmmo/TotalAmmo`
+   全部**纯属性写入**（不调游戏函数）；武器对象仍按基础 pak 的 76 个 `WPN_*` 类名逐个 `FindAllOf`。
+3. **黑掉「挖掘速度」** ✅：ini 里 `sealed=1`（点不动）+ 说明写清；
+   引擎里也不再每 100ms 驱动它（真机制要调材质函数 → UE4SS 崩，两次 dump 实证）。
+4. **夜视解封** ✅：ini 里撤掉 `sealed=1`；走引擎原有的 `applyLight`：
+   把玩家灯光组件的 `Intensity` 拉到 100000、`IntensityUnits=0`（关掉平方反比衰减，Intensity 才线性生效）、
+   大 `AttenuationRadius`、宽锥角、不投影。
+   ⚠ 诚实说明：这条以前没验证成功过；若无效，下一轮照用户装的 **Brighter Objects** mod 扒实现
+   （它改的是"物体亮度参数"，和玩家探照灯不是一回事——这可能就是我们一直没效果的原因）。
+二、工程
+  · `ini_ver 68→69`（loader 检查值同步 69）；段数 101。
+  · `out\FSDTrainer.dll` / `out\Carlhand.exe` = v90（DLL 内含 v90 与 `clip_size` ✓）。
+  · 游戏目录 ini 已同步到 v69；那个跑着的游戏进程当时已退出/变僵尸，所以**请直接跑 out\Carlhand.exe**。
+三、关于"改不动"的两项（留给下一步）
+  · 血/盾上限：游戏每帧重算 `MaxHealth/MaxArmor`，属性写入赢不了 → 只剩"30ms 抢帧"或"`canTakeDamage=false` 无敌"。
+  · 挖掘速度：真机制=地形材质参数（mod 实证），但**从 Lua 调材质函数会让 UE4SS 崩** → 这条路封死。
+
+【2026-09-19 19:14 · v91（弹药"写失败就重试" + 夜视加雾）】
+背景：v90 那个"跑着的游戏"在 19:09:46 之后就没心跳了（PID 6312 变成 0MB 僵尸），
+      所以 v90 的 DLL 其实**没在游戏里生效过**，v91 直接一起带上。
+一、弹药（用户：「倍率有效但不可控，我要精确改弹容量」）
+  · 弹匣容量 `clip_size` / 备弹容量 `reserve_ammo`：写绝对值。
+  · **修 bug**：旧逻辑"值一变就写一次"，在空间站/菜单里设值时武器还没 spawn → 写失败之后
+    再也不会重试 ⇒ 用户进任务发现没反应，感觉"不可控"。现在：
+      - 失败（没找到对象 / 没匹配到字段）→ **下一帧继续重试**，直到真正写进去；
+      - 成功之后只在数值再变时才写（不每帧补满，避免变成"无限弹药"）；
+      - 重试帧静默（不刷 dump）。
+  · `fill` 参数：只有玩家改数值的那一次连「当前弹药」一起补满。
+二、夜视（`bright_light`）
+  · 以前只调玩家探照灯 → 效果不明显。v91 追加 **`applyFogClear`**：
+    找 `ExponentialHeightFogComponent`，把 `FogMaxOpacity=0`、`FogDensity ×0.15`、
+    `StartDistance=20000`、`bEnableVolumetricFog=false`（全是纯属性写入，不调游戏函数，
+    原值记下来，关功能时还原）。
+  · 第一次开启会把**所有灯光候选**的 Intensity/半径打进 dump，方便下次挑对组件。
+三、工程
+  · 引擎 v90→v91（banner 改了，dump 里能看到「>> 功能引擎 v91 已载入」）；
+  · Lua 12 块、最大 15278B（<16380）、luaparser 解析通过；
+  · `out\FSDTrainer.dll`(553984B 19:13:50) / `out\Carlhand.exe`(19:13:53) 已重建，
+    验证含 `功能引擎 v91` / `applyFogClear` / `ExponentialHeightFogComponent` / `clip_size`。
+四、仍未解决
+  · 血/盾上限：属性写入被游戏每帧改回（HUD 125/30）。
+  · 挖掘速度：真机制=地形材质参数，从 Lua 调材质函数会崩 → 已"黑掉"（ini 段删除，引擎不再驱动）。
+
+【2026-09-19 19:40 · v92（删全亮/关雾 · 封印飞行 · 夜视=关全部阴影 · 弹药只改手上这把）】
+一、用户四条要求
+1. **删掉「全亮/关雾」** ✅
+   · 引擎里 v91 加的 `applyFogClear`（把 ExponentialHeightFog 压掉）和"探照灯 Intensity=100000 /
+     关平方反比衰减"整段**删除**，`applyLight` 改为 `applyShadowOff`。
+   · 顺带查出菜单里那个「全亮/关雾」是 **ini 损坏**：`addr=0[feature.挖掘速度]`（标头粘在值后面）+
+     `[feature.全亮/关雾][feature.设置血量]`（两个标头粘一行）。已拆开 → **「设置血量」恢复**（真身是
+     `key=set_health`）。若这个功能也不想要，说一声删掉即可。标头/`cat=` 现在 100/100，无粘行、无重复键。
+2. **封印「飞行模式」** ✅：`sealed=1`（菜单里灰掉）。按用户要求**没有加任何说明文字**，note 原样保留。
+3. **夜视 = 完全屏蔽游戏内所有阴影**（按用户给的思路重写）✅
+   · `applyShadowOff`：扫 `LightComponent/SpotLight/PointLight/RectLight/DirectionalLight/SkyLight`
+     六类，对每个对象写 `CastShadows=false`、`bCastShadows=false`、`CastDynamicShadows=false`、
+     `bCastDynamicShadow=false`、`CastTranslucentShadows=false`（**纯属性写入，不调任何游戏函数**），
+     玩家自身 `Mesh` 也关；**不改亮度、不动雾**。
+   · 照明弹等灯是动态生成的 → 每 ~3 秒重扫一次，只处理新对象（稳态几乎零开销）；关开关时把原值写回。
+4. **弹匣/备弹 = 只改「手上这把」** ✅
+   · 新增 `handWeapon(pawn)` 四级识别：① 玩家身上 `CurrentWeapon/ActiveWeapon/EquippedWeapon/
+     HeldWeapon/Weapon/CurrentItem/ActiveItem/…` 指针（最准）→ ② 背包/装备组件里的当前项 →
+     ③ 从类名扫出来的对象里挑 `bEquipped/bIsActive/Visible…` 为 true 的 → ④ 只有一个对象才兜底；
+     认不出来就**不写**（宁可不改也绝不乱改别人的枪），并把玩家属性名 dump 一次供下轮定位。
+   · 主循环改成**每帧调用**（300ms）：容量键持续校正，**当前弹药只在"改数值 / 换枪"那一次补满**
+     → 实时、换枪自动跟随、不会变成每帧补满的无限弹药。日志里带读回值（例：`ClipSize=20, AmmoCount=20`）。
+二、工程
+  · 引擎 v91→v92；`ini_ver 69→70`（64 行 loader 检查同步 70）——强制 loader 覆盖游戏目录里那份**旧的粘行 ini**。
+  · 修好一个 C++ 级事故：v91 那次替换把 `R"FSDLUA(` 开口吞掉 → 原始字符串未闭合、编译报 C2143；
+   同时块边界把换行吃掉导致 `endlocal function`。现在 12 块 / open=close=12，
+    最大块 16341B（<16380）、`luaparser` 解析通过、构建成功。
+  · `out\FSDTrainer.dll`(552960B) / `out\Carlhand.exe`(19:4x) 已发布；ini 已同步到游戏目录。
+三、仍未解决
+  · 血/盾上限：写进去被游戏每帧改回（HUD 125/30），待定方案 = 30ms 抢帧重写 或 `canTakeDamage=false` 无敌。
+
+【2026-09-19 21:4x · v93（删血/盾/设置血量 · 修「无敌」崩溃）】
+※ 用户在玩游戏 → **没有动游戏目录、没有热载、没有杀进程**；构建在 `_build_v93\`，产物发布到 `out\v93\`。
+一、用户四条
+1. **删除「设置血量」** ✅：ini 段删除；引擎里 `Cheat_SetHealth` 的驱动也删了（不再发命令）。
+2. **删除「血量上限」「护盾上限」** ✅：两个 ini 段删除；100ms 循环里的持续重写 + 主循环驱动全部删掉
+   （血/盾上限那条路本来就写不进去，游戏每帧改回 110/25，用户 HUD 永远 125/30）。
+3. **点「无敌」就崩 → 定位到了真凶** ✅
+   证据链：
+     · `FSDTrainer.log` 21:12:29 `功能[无敌+复活] 已开启`
+     · `FSDTrainer_dump.txt` 该会话**最后一行** = `命令[C_Revive] ok=true`（之后 dump 就断了）
+     · UE4 崩溃报告（21:12:30，UE4CC-...0F4AB2C0…）：`EXCEPTION_ACCESS_VIOLATION reading
+       0xffffffffffffffff`，PCallStack **全在 FSD-Win64-Shipping 里**（没有 UE4SS 帧）
+   ⇒ 菜单那个段真名是 `[feature.无敌+复活]`，但它的 key 是 `auto_revive`（**名字与字段错位**：
+     只有"复活"被实现了，而且实现方式是每 2 秒发一次 `C_Revive`）。游戏自己的复活作弊路径是坏的。
+   处理：
+     · **`C_Revive` 的自动驱动整段删除**（引擎里再无 auto_revive 分支）。
+     · `[feature.无敌+复活]`（key=auto_revive）→ **`[feature.无敌]`（key=god）**。
+     · 新的「无敌」= **纯属性写入，一个游戏函数都不调**：对 pawn / Health 组件 / DamageComponent 写
+       `canTakeDamage=false`、`bCanBeDamaged=false`（以及若干同义候选），写完**立刻读回**并打日志；
+       每次主循环（300ms）重写一次防游戏改回；匹不上字段就把三者的属性名 dump 一次（只列名）。
+     · **真字段是从 dump 实测挖出来的**：第 17733 行那条 `HealthComponent 宽关键字` 探测命中
+       `canTakeDamage`（**小写 c**）、`OnCanTakeDamageChanged` → UE4SS 的 SetPropertyValue 大小写敏感，
+       候选表里原样带上小写版，否则永远写不进去。
+4. **别动我游戏** ✅：本轮全部只"读"，没有写游戏目录、没有热载 engine、没有结束进程。
+二、工程
+  · 引擎 v92→v93；Lua 12 块 → **13 块**（`tools/split_block.py` 自动把 19382B 那块拆成 14103+5606），
+    最大块 15258B（<16380），`luaparser` 解析通过，`kCheatEngineLuaPartCount=13`。
+  · ini：`headers=97 / cat=97`，无粘行、无重复键；已删 3 个功能，`[feature.无敌]` key=god。
+  · `out\v93\Carlhand.exe` / `FSDTrainer.dll` / `FSDTrainer.exe` / `FSDTrainer.ini` 已发布并校验
+    （DLL 含 `功能引擎 v93`+`applyGodMode`+小写 `canTakeDamage`；EXE 含 `ini_ver=70` 且已无三个已删功能）。
+  · 注意：`out\` 根目录那份 DLL 仍是 v92（游戏正在跑，映射中不能覆盖）→ 下次要用 **`out\v93\Carlhand.exe`**。
+
+【2026-09-19 21:5x · v94（「无敌」改名「无敌+自起」 · 自起=死亡自动复活，走纯属性写入）】
+一、用户两条
+1. **改名** ✅：`[feature.无敌]` → `[feature.无敌+自起]`（key 仍是 `god`，一个开关管两件事）。
+2. **自起 = 死亡时自动复活** ✅（但实现方式和崩掉的那版**完全不同**）
+   · **绝不再用 `C_Revive`**：证据是两次崩溃现场 dump 的**最后一行**都是 `命令[C_Revive] ok=true`
+     （19:09 起每 2 秒刷屏 → 19:10:01 崩一次；21:12:29 又崩一次）⇒ 游戏自带的复活作弊路径是坏的，
+     什么时候崩只是时间问题，跟"是否真死"无关。代码里保留 `revive="C_Revive"` 只为记录，
+     并加了醒目注释：**功能表里没有任何 key 映射到 revive，绝不要给它接开关**。
+   · 新的 `applySelfRevive`（v94）：**纯属性写入**
+       ① 判死：pawn / Health 组件的 `bIsDead/IsDead/bDead/bIsDowned/IsDowned/Downed/bDowned` 任一为 true，
+          或血量字段（`Health/CurrentHealth/HealthValue/CurrentHealthValue`）<= 0；
+       ② 自救：把血量写回 `MaxHealth`；把上面那串死亡/倒地标志写 false；
+          把 `bIsAlive/IsAlive/bAllowRevive/bIsRevivable/bCanBeRevived` 写 true；
+          三处对象都试：pawn、Health 组件、PlayerState；
+       ③ 死亡状态下第一次会 **dump 一次**这三处的"死亡相关"属性名（只列名）→ 下一轮可锁定真字段；
+       ④ 和无敌共用开关（`god=1`），主循环 300ms 检查一次。
+   · ⚠ 老实说：纯属性自起**可能不生效**（游戏的复活流程也许还需要它自己的逻辑跑一遍）。
+     如果无效，我按 ③ 的 dump 继续锁字段；但**不会**退回 C_Revive。
+二、工程
+  · 引擎 v93→v94；Lua 13 块、最大 15422B（<16380）、`luaparser` 通过。
+  · `ini_ver 71→72`（loader 同步）→ 强制覆盖游戏目录那份，避免菜单还是旧名/旧功能。
+  · 发布：`out\`（根：FSDTrainer.dll / FSDTrainer.exe / Carlhand.exe / Carlhand.dll）
+    + `out\v94\` 备份 + 游戏目录 `FSDTrainer.ini`（已确认含 `[feature.无敌+自起]`、`ini_ver=72`）。
+
+【2026-09-19 22:0x · v95（修「关掉无敌还无敌」· 删「霸体」「设置随机名字」）】
+一、用户三条
+1. **关闭「无敌+自起」后依旧无敌 → 找到根因并修掉** ✅
+   证据（用户机器的 dump）：
+     · `[无敌] 已写：pawn.bCanBeDamaged=false, Health(PlayerHealthComponent).canTakeDamage=false`
+       → **写入本身是有效的**（读回也确实是 false），所以"无敌"确实生效了；
+     · 但同一个会话里出现过 `[无敌] 已写：pawn.bCanBeDamaged=false`（**只剩 1 项**）+
+       `没匹配到【能否受伤】字段` → 说明血组件的 `canTakeDamage` **已经是 false 了**（所以没写、也不算 hit）。
+   根因（v93/v94 的写法有缺陷）：
+     · 原值是按**目标名字**（"pawn"/"Health(...)"/"DamageComponent"）存的。换图 / 重生 / 死亡后
+       **PlayerHealthComponent 会换成新对象**，旧记录 `rec.o` 失效 → 新组件永远收不到还原；
+     · 更糟的是下次开启时 `rec.v` 里已经有值 → **不再重新采集真原值** ⇒ **一旦某次还原失败就永久无敌**。
+   修复（v95）：
+     · 记录改成按 **对象实例地址** 分开存（`名字#地址`），每个实例各自采集自己的原值；
+     · 关闭时除了还原旧记录，还对**当前身上**的 pawn / Health / DamageComponent **强制**写回
+       「可受伤」（can 类 → true，免疫类 → false），并且**读回写日志**（例：
+       `[无敌] 已关闭：旧记录还原 1 个对象；当前对象强制还原 ... canTakeDamage=true(读回 true)`）
+       → 保证一定还原得掉，也方便下轮核对。
+2. **删除「霸体」** ✅：ini 段删除（key=`cc_immune`，本来就是 sealed）；引擎里 `pcall(applyCC,...)`
+   调用也删掉（霸体从此不再驱动）。
+3. **删除「设置随机名字」** ✅：ini 段删除（它本来就是 `kind=freeze` 的冻结项）。
+   （之后如果有需要，我可以按你授权随时结束游戏进程，用来解锁 `out\` 里的 DLL；本次没用到——游戏当时没开着。）
+二、工程
+  · 引擎 v94→v95；Lua 13 块、最大 15422B（<16380）、`luaparser` 通过。
+  · ini：`headers=95 / cat=95`，无粘行、无重复键；`ini_ver 72→73`（loader 同步）→ 强制覆盖游戏目录那份。
+  · 一次差点翻车：先改 ini/loader 才同步到构建树的 `src`，导致第一次构建出来的 DLL 里 banner 还是 v94
+    （校验时 `功能引擎 v95` FAIL 抓到了）→ 重新同步 src 再构建，已复校通过。
+  · 发布：`out\`（根）与 `out\v95\` 均为 v95；游戏目录 `FSDTrainer.ini` = v73。
+
+【2026-09-19 22:3x · v96（只对自己生效 · 锁血 · 广域手电筒 · 逃兵 · 崩溃隐患大清查）】
+※ 用户正在玩游戏 → **没杀进程、没热载、没动游戏目录里的东西**；因 `out\FSDTrainer.dll` 被映射占用，
+   v96 发布在 `out\v96\`（游戏目录的 ini 已更新到 ini_ver=74）。
+一、五条要求
+1. **所有功能只对自己生效** ✅ 删掉 5 个会影响队友/全队的功能：
+   「传送队友集合」(teleport_to_me=C_TeleportAllPlayersToMe)、「杀全队」(kill_team=C_KillTeam)、
+   「杀某个队友」(kill_slot)、「醉酒-玩家编号」(intox_player)、「醉酒-数值」(intox_value，
+   它走的是 **C_Intoxication_SetAll → 影响全队**，最该删)。
+   引擎侧：ACT 里 teleport_to_me/teleport_near/kill_team 映射删除；kill_slot 与 intox 的驱动整段删除。
+   「显示队友」只影响自己屏幕显示、不改对方状态 → 保留。
+2. **无敌 → 锁血** ✅ 段名改为「锁血+自起」（key 仍是 `god`，一个开关=锁血+死亡自动复活）。
+3. **新增「我要当逃兵」（常规-动作）** ✅
+   依据：游戏 pak 里确实有 `/Game/.../Cheat_ReturnToSpacerig.uasset`（和曾经崩过的 Cheat_Resupply 同族）。
+   做法：候选顺序发控制台命令，**每点一次换下一条**并把"试的是哪条"写进 dump：
+     ① `Cheat_ReturnToSpacerig` → ② `CheatScript ReturnToSpacerig` → ③ `C_FailMission`（兜底，会判失败）
+   前两条能用的话，回到空间站且不判成功/失败。
+4. **夜视 → 广域手电筒** ✅
+   实测（dump）玩家照明就是 pawn 上的 **SpotLight**（SpotLightComponent），原值 Intensity=50、半径=110。
+   现在只动自己这一盏：AttenuationRadius=60000、OuterConeAngle=89、InnerConeAngle=86、
+   bUseInverseSquaredFalloff=false、IntensityUnits=0、Intensity=20000、CastShadows=false；
+   关掉时按**真原值**还原（顺手修掉旧版还原硬编码 50/150 的错）。
+   原来那套"关掉全地图阴影"**整段删除**。
+5. **崩溃隐患清查** ✅（三次崩溃 minidump 全部解析）
+   · 21:12:30 与 21:25:53 两次：`UE4SS.dll+0x52DBB9`，读地址 0x18
+     —— 就是已知的 **FName::ToString/GetFullName 对"正在销毁的对象"取名字**。
+   · 21:45:24 那次：`UE4SS.dll+0x4BAAAF`，读地址 0xC（大量属性读写之后 UE4SS 内部出问题）。
+   对上号的隐患与处置：
+     ① 每次换图/重生都打 `nm(pawn)`（GetFullName）——而"新角色刚出现"正是旧对象在销毁的时刻 → 改成只打地址。
+     ② v94/v95 的 `godTargets` **每 300ms 调一次 clsOf(血组件)**（FName::ToString）→ 改成静态标签，不再取名字。
+     ③ 夜视"关阴影"要扫 **1092 个灯光组件**、上万次属性读写（dump 里有 458/509 个开关）→ 整段删除（见第 4 条）。
+     ④ **分块数常量与数组长度不一致**：`kCheatEngineLuaPartCount=13` 而数组只有 12 块 →
+        dllmain 的 for 会越界读 `kCheatEngineLuaParts[12]`（strlen 野指针）→ 直接崩。
+        已改成 12，并加 **static_assert** + 循环改用数组实际长度（以后忘改，编译就失败，不会带着隐患出厂）。
+     ⑤ 限流：「怪物全灭/杀戮光环」整段限流 1 秒（原来 300ms 就枚举全场）；弹药"手上这把"的兜底扫描
+        1.5s → 6s（76 个类名 FindAllOf 太贵）。
+   · 另外发现一件"看着像崩溃其实不是"的事：日志 22:03:16 有
+     `收到杀死键 END：正在卸载修改器` → 你按了 **END 键**，修改器主动卸载了自己（菜单从此不出现、
+     但游戏继续跑）。要恢复重新跑一次 exe 即可。
+二、工程
+  · 引擎 v95→v96；Lua 12 块（最大 15422B，<16380）、luaparser 通过、构建通过。
+  · ini：`headers=91 / cat=91`；`ini_ver 73→74`；新增 `[feature.我要当逃兵]`；
+    改名 `[feature.锁血+自起]`、`[feature.广域手电筒]`（key=`wide_light`）。
+  · 产物：`out\v96\`（Carlhand.exe / FSDTrainer.dll / FSDTrainer.exe / FSDTrainer.ini）。
