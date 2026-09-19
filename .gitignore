@@ -1,0 +1,24 @@
+﻿# build intermediates
+build/obj/
+*.obj
+*.cso
+*.res
+*.pdb
+*.lib
+# runtime / logs
+*.log
+*.pid
+*.bmp
+*.dmp
+out/FSDTrainer.exe
+out/FSDTrainer.dll
+out/monitor.log
+out/kill_zombie.txt
+out/verify/*.exe
+out/verify/*.ini
+out/verify/*.txt
+out/verify/*.lua
+out/verify/Mods/
+# misc
+__pycache__/
+*.tmp

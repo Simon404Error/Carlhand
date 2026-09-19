@@ -1,0 +1,372 @@
+【本次会话固定工作目录】260918_143041
+深岩银河（Deep Rock Galactic）DX12 修改器 “FSDTrainer”
+
+================== 目录结构（已整理） ==================
+【文件说明】.txt        本说明
+设计文档.md             总体设计：DX12 挂钩、输入拦截与卸载、功能面板、向导、实测与排错记录、风险
+
+src\                    修改器 DLL 源码（C++17，仅 Windows SDK + D3D12/D3D11/GDI，无第三方库）
+    dllmain.cpp           入口：初始化、热键线程、END 杀死修改器
+    overlay.cpp/.h        Present/ResizeBuffers/ExecuteCommandLists 虚表挂钩 + D3D12/D3D11 覆盖层 + 输入拦截
+    ui.cpp/.h             界面：功能面板 / 向导 / 扫描 / 冻结 / 补丁 / 命令 / 参考 / 设置，可拖动、软件光标
+    scanner.cpp/.h        内存扫描（含未知初始值）与冻结器（锁定/写回原值）
+    patches.cpp/.h        AOB 补丁引擎 + 功能面板表 FeatureTable（patch / freeze / cmd）
+    mem.cpp/.h            模块基址、特征码扫描、内存读写（快速路径）
+    config.cpp/.h         ini 解析（热键、扫描范围、UE 控制台特征码）、功能表段落
+    hook.cpp/.h           虚表挂钩
+    log.cpp/.h            日志（UTF-8、共享可读）
+    shaders.hlsl          全屏三角形采样 UI 纹理（fxc vs_5_0/ps_5_0）
+    shader_blob.h         构建时由 fxc 输出自动生成（着色器字节码数组）
+
+loader\                 单文件启动器源码（FSDTrainerLoader.cpp：找进程/启动游戏/部署配置/远程注入/提权）
+
+test\                   验证程序源码
+    Dx12Test.cpp          自建 D3D12 交换链 + 后备缓冲回读统计 + END 卸载验证
+    D3D11Test.cpp         自建 D3D11 交换链验证
+
+build\                  构建脚本
+    build.bat             编译 out\FSDTrainer.dll（中间产物全部落在 build\obj\）
+    loader.bat            打包 out\FSDTrainer.exe（内嵌 DLL 与默认配置）
+    repack.bat            游戏占用 DLL 时用：先检测游戏是否退出，再重编 + 重打包
+    test.bat              编译验证程序到 out\verify\
+    gen_blob.ps1          着色器字节码转 C 数组
+    obj\                  中间产物（*.obj / *.cso / *.res / *.rc），可随时删除
+
+config\
+    FSDTrainer.ini        运行时配置（UTF-16LE，必须）：热键 / 扫描范围 / UE 控制台特征码 / 功能表：页签=分类（常规/武器道具/钻机手/工程师/枪手/侦察兵/特殊功能/调试数据）+ 设置，共 76 项
+
+inject\                 Xenos 手动映射注入方案（可选，隐蔽性更好）
+    inject.bat / Make-Xpr.ps1
+
+out\                    最终产物
+    FSDTrainer.exe        单文件启动器（约 551 KB，双击即用）
+    FSDTrainer.dll        修改器本体（供 Xenos 注入）
+    FSDTrainer_ui.png     功能面板实测截图
+    verify\               验证程序 Dx12Test.exe / D3D11Test.exe 及其专用 ini（menu_open=1）
+
+================== 使用 ==================
+1. 游戏以 DX12 运行（Steam 启动项 -dx12）→ 双击 out\FSDTrainer.exe，提示注入成功
+2. 游戏内 INSERT 呼出「功能面板」，点按钮即开启，再点关闭并恢复原状；按住标题栏可拖动
+3. 没有数据的按钮：先在「设置」打开高级功能 → 「扫描」找到数值并选中 → 回到面板点该按钮即完成绑定（写入 ini）
+4. END 杀死修改器（解除挂钩、恢复窗口过程、卸载 DLL，游戏无需重启）
+5. 重新打包：关掉游戏后运行 build\repack.bat
+
+参考：D:\SOMTOLS\DeepRockGalactic\in\Xenos64.exe（其 26.8.25-New.dll 即「深岩银河 TOOLS」，功能表按同样交互在本工具中重建）
+
+【2026-09-18 20:07 新增】
+- reference\cheats\FSDCheatManager_全命令表.txt : 从游戏进程内导出的 FSDCheatManager 全部 266 条作弊命令原名
+- reference\cheats\作弊命令映射.md : 266 条命令 → 训练器功能 的映射表、特征状态文件协议、已知坑
+- 游戏目录内新增（非本目录）：FSD\Binaries\Win64\FSDTrainer_features.txt（功能状态文件，UTF-8 无 BOM）
+- 游戏目录内更新：FSDTrainer_code.lua = 功能引擎 v8（每 300ms 读特征文件应用功能，逐功能 pcall 保护）
+
+【2026-09-18 20:11 新增/更新】
+- src\cheat_engine.h : 内嵌的游戏内 Lua 引擎 v10（LOCKS 连续锁 + ACT 命令表），DLL 启动时写入游戏目录
+- src\patches.h / patches.cpp : 新增 kind=cheat（写状态文件）、Fire（动作型）、SetBridge / WriteFeaturesFile
+- src\ui.cpp : cheat 型不再要求绑定地址；动作型走 Fire
+- src\dllmain.cpp : 启动时部署引擎脚本 + 在 FSDTrainer_cmd.txt 写加载指令 + 打通状态文件
+- build\convert_features.ps1 : 批量把 ini 功能转成 kind=cheat 并追加新功能（必须用带 BOM 的这个版本）
+- config\FSDTrainer.ini : 89 个功能节；旧版备份 config\FSDTrainer.ini.bak
+- out\FSDTrainer.dll : 已重编译并注入游戏，本次会话内实测通过
+
+【2026-09-18 20:22 新增/更新】
+- 常规页功能可实现性.md : 常规页 17 项功能的逐项核查（8 项已生效 / 4 项 ESP 待开发 / 3 项等属性探测 / 1 项有替代）
+- src\cheat_engine.h : 升级为引擎 v11（+= 半径杀戮光环、坐标 API 自动探测、只读属性探测 Pawn/MoveComp/Health/PlayerState）
+- config\FSDTrainer.ini : 90 个功能节（新增 [feature.杀戮光环范围] key=killaura_radius 默认 15 米）
+- out\FSDTrainer.dll : v11 重编译完成
+- out\FSDTrainer.exe : 重新打包完成（内嵌 v11 DLL + 90 节 ini，已校验）
+
+【2026-09-18 20:27 事故修复】
+- 卡初始化原因：旧引擎在开机阶段自动运行，读图时向已销毁对象写属性，UE4SS 日志刷屏 "UObject instance is nullptr"
+- src\cheat_engine.h : 升级 v13（就绪门控 + 有效性校验 + 未就绪时 1/10 探测 + 首次载入不触发命令）
+- 游戏目录 FSDTrainer_code.lua 已热加载到 v13；游戏内引擎日志确认「世界已就绪」
+- out\FSDTrainer.dll / out\FSDTrainer.exe 待重新编译打包（训练器已注入被占用，按 END 后可重编）
+- 事故记录见 常规页功能可实现性.md 第六节
+
+【2026-09-18 20:48 第二轮修复】
+- 游戏目录 Mods\FSDTrainerMod\Scripts\main.lua : 执行器 v6 -> v7（无对象时零探测 + 30 秒心跳 + 异常兜底），备份在 reference\FSDTrainerMod_main_v7.lua
+- src\cheat_engine.h : 引擎 v15/v16/v17（移除全部反射枚举；移速/跳跃改写 CharacterMovement；喷气靴子关闭尝试；速度基准动态校准）
+- config\FSDTrainer.ini : 89 个功能节（删除重力；移速/奔跑改为倍率）
+- src\ui.cpp : 未实现功能自动灰掉且不可点
+- build\inject_dll.ps1 : 已删除（改用 loader 注入；自写注入器在游戏里失败，原因未明）
+- 待办：关掉游戏后重编 out\FSDTrainer.dll（内嵌 v17）并 rebuild loader
+
+【2026-09-18 20:53 收尾】
+- src\cheat_engine.h : 引擎 v18（载入即捕获速度基准；未设奔跑倍率时自动还原游戏自己的冲刺速度）
+- out\FSDTrainer.dll : v18 重编译完成；out\FSDTrainer.exe : 重新打包完成并已校验
+- 注意：loader 是直接把 out\FSDTrainer.dll 加载进游戏的，所以注入期间该文件会被占用（要重编必须先 END 或退游戏）
+
+【2026-09-18 21:02 输入框与数值安全】
+- src\ui.cpp / ui.h : 输入框点一下即全选、直接打字替换；退格/Delete/Ctrl+A/上下键/滚轮微调/回车应用/Esc 取消；编辑期间清空不再被旧值回填（修"回弹"）
+- src\cheat_engine.h : 引擎 v20（倍率 0.1–20、跳跃 100–5000、跳次 1–99 钳制；脏速度值自动重置）
+- src\overlay.cpp : ResizeBuffers 日志去重（原先刷了 5 万条）
+- out\FSDTrainer.dll / exe : 已重编译重打包（内嵌 v20）
+
+【2026-09-18 21:08】
+- 改名：菜单标题/设置页/日志抬头 -> 卡尔的大手 (Carlhand)；out\Carlhand.exe
+- src\ui.cpp / ui.h : 输入框支持光标左右移动、在光标处插入、Home/End/Delete、左侧 ±1 按钮、回车应用
+- config\FSDTrainer.ini : 无限跳跃 -> 开关(inf_jump)；瞬间复活 -> 开关(auto_revive)
+- src\cheat_engine.h : 引擎 v21（inf_jump 开关、auto_revive 开关 + 2 秒兜底）
+
+【2026-09-18 21:2x 第11项反馈处理】
+- src\overlay.cpp : 菜单隐藏时跳过软件绘制与纹理上传（修读图卡顿）；ResizeBuffers 日志去重
+- src\ui.cpp : 数值统一两位小数
+- src\dllmain.cpp : 功能热键支持（feature.* 的 hotkey=，动作型 Fire / 开关型 Toggle）
+- src\cheat_engine.h : 引擎 v22（已编译注入）/ v23（待编译：霸体第二批候选 + Health.InvulnerabilityDuration + 喷气靴按类名搜索）
+- config\FSDTrainer.ini : 无敌=auto_revive；喷气靴(action,F6)；移除自身喷气靴(action,F7)；霸体/全图高亮改 cheat 型
+
+【2026-09-18 21:5x】
+- src\cheat_engine.h : 引擎 v24→v27（飞行加 bCheatFlying 可上下飞；夜视改保守值防崩；奔跑基准只取一次修失控；卸下喷气靴改为强制回走路模式）
+- cheat_engine.h 改为分块存放 Lua（MSVC 单字符串 16KB 上限，C2026），dllmain 写入时按块拼接
+- out\FSDTrainer.dll / FSDTrainer.exe / Carlhand.exe : v26 已编译打包（v27 待编译）
+
+【2026-09-18 收尾】交接文档.md
+- 交接文档.md : 写给下一个 AI 的完整交接（现状/路径/架构数据流/已验证功能/未完成清单/机制速查/坑/立刻要做的三件事/构建流程/用户偏好）
+- 最新产物：out\FSDTrainer.dll、FSDTrainer.exe、Carlhand.exe
+
+【2026-09-18 深夜 · 进任务崩溃修复（v35/v36）】
+根因（有 dump 实证，见 交接文档.md 第 10 节）：
+- 6 次 CRASH 的 RIP 都是游戏自己的 FName::ToString，调用链是 UE4SS!UObject::GetFullName
+  ← Lua 侧把 o:GetFullName() 当成"对象有效性校验"用。换图/进任务时 Pawn 已销毁但属性里还留着
+  已释放的指针，GetFullName 去读它的 FName 索引 → 读地址 0x18 崩进程。
+- 另一个大坑：游戏目录残留的 FSDTrainer_code.lua/cmd.txt 会让执行器在"单独启动游戏"时
+  自动加载上一版引擎；训练器注入后再加载新版 → 两个 LoopAsync 同跑，旧版（用 GetFullName）
+  照样崩，而 UE4SS 无法从外部取消旧循环。
+
+改动：
+- src\cheat_engine.h : 引擎 v36
+    valid() 改用 UE4SS IsValid()（不再 GetFullName）；新增安全 nm()/addrOf()；
+    修掉 v34 主循环调用未定义 nm() 的致命 bug（导致 v34 的修复根本没跑）；
+    换图判定改用 GetAddress() 比较 + "曾失去 pawn" 标志；换图后静默 5 秒；
+    跳跃/跳次改为"先读再比、不一致才写"；ESP 需世界稳定 15 秒、杀戮光环 8 秒；
+    新增世代号 _G.__FSDT_GEN，新引擎载入时旧循环自动退出
+- src\dllmain.cpp : 新增 NeutralizeCmdThread，注入 15 秒后把 FSDTrainer_cmd.txt 置空，
+    使"单独启动游戏"不再自动加载旧引擎
+- build\dumpinfo.py / dumpsig.py : minidump 解析（异常码/RIP/栈/模块归属）
+- build\peexp.py : PE 导出表解析（用 UE4SS.dll 的 C++ 符号把栈地址定位到函数名）
+- build\extract_lua.py / partscheck.py / lint_lua.py : 引擎 Lua 分块大小、语法、未定义函数检查
+- out\FSDTrainer.dll、FSDTrainer.exe、Carlhand.exe : v36 已重编译重打包
+
+已实测（游戏内日志）：v36 单循环载入、IsValid 可用、换图日志只出现 1 次、
+状态行每 12 秒正常、移速 1→2 写 600 读回 600 生效、单独启动游戏不再加载旧引擎、
+注入后 15 秒命令文件被置空。
+**用户进任务玩了一会儿：不崩（v36 之后主循环异常 0 条、无新 crash_*.dmp）。崩溃问题闭环。**
+
+【2026-09-18 深夜 · 第二轮：页面精简 + ESP（引擎 v37）】
+页面精简（已截图验证，out\verify\ui_menu_dx12.png）：
+- 删除「补丁 / 命令 / 参考」三个页签，高级页只留「扫描 / 冻结」；三个页面函数保留但不再引用
+- advanced 默认改成 1（config.cpp + 三个 ini），即扫描/冻结默认显示，不用再进设置页打开
+- 设置页无「注意」字样（已确认）
+
+ESP（显示敌人 / 显示采集）：
+- 数据链路：Lua（每秒 1 次、世界稳定 15 秒后、最多 60 目标、IsValid 校验、距离=菜单里填的米数）
+  用 pc:ProjectWorldLocationToScreen 取屏幕坐标 → 写 FSDTrainer_esp.txt（E/M x y 距离米）
+  → DLL 侧 250ms 查文件时间戳、变了才重读 → 画红框(敌人)/青框(矿物)+距离标签
+- 敌人过滤规律（那一局实测到的类名）：/Game/Enemies/、/Game/Critters/ 下的是敌人；
+  /Game/GameElements/（BP_Donkey、BP_MiniMule_Salvage）要排除
+- 已实测：DLL 侧渲染（造假数据 out\verify\FSDTrainer_esp.txt，截图 out\verify\esp_test.png），
+  含菜单隐藏时也能画
+- 未实测：Lua 侧真机采集（要进任务）；看 dump 里有没有「[ESP] 坐标投影可用」
+
+【2026-09-18 深夜 · ESP 第二次修复（引擎 v39）】
+第一次失败原因（已查明）：UE4SS 里 PlayerController:ProjectWorldLocationToScreen 根本调不通，
+5 种调用形式全部 pcall 失败（错误对象还是个 function），出参结构体拿不到 → 一个框都写不出来。
+
+v39 改成"自己算投影"：
+- 朝向 pc:GetControlRotation()（UFunction→table，实测可靠）
+- 相机 pc.PlayerCameraManager → cam:GetCameraLocation()（退化：CameraCache.POV.Location → 玩家坐标+60cm）
+- FOV cam:GetFOVAngle()（退化：DefaultFOV → 90）
+- 视口尺寸由 DLL 写 FSDTrainer_vp.txt（Lua 每 5 秒读一次）
+- 公式 tanY=tanX/(W/H)，屏幕坐标 = 中心 ± 归一化偏移
+- 性能：每轮只取一次视角，每个目标只做纯 Lua 数学（不再每个目标调 UFunction）
+
+新增自检日志（不用进任务也能验证投影）：
+  [ESP自检] 方式=calc 视口=1920x1200 正前方10米屏幕坐标=960,542（期望 ≈ 960,600）
+实测稳定落在屏幕正中央 → 投影参数正确。
+调试开关：环境变量 FSDTRAINER_ESP_SELF=1 时把自检点当成敌人写进 esp 文件（验证整条链路用）。
+
+引擎 Lua 因超 16KB 限制，已拆成 5 块（dllmain 按顺序拼接）。
+菜单里「显示敌人 / 显示采集」的值 = 显示距离（米），0=关。
+
+新增/改动文件：
+- src\cheat_engine.h（引擎 v37）、src\ui.cpp / ui.h（页签 + ESP 画框）、
+  src\overlay.cpp（viewW/viewH + ESP 不走隐藏快速路径）、src\config.cpp（advanced 默认 1）
+- build\mk_verify_ini.py（造 verify ini）
+- 界面自测方法：test.bat → 设 FSDTRAINER_DUMP_UI=1 启动 out\verify\Dx12Test.exe → 注入 DLL
+  → out\verify\FSDTrainer_ui.bmp 就是界面截图
+
+【2026-09-19 01:00 · 重大事故：游戏目录的 UE4SS 被换成了"不支持 Lua"的版本】
+现象：菜单/覆盖层正常，但所有游戏内功能静默失效（dump 不新增、ESP 永远 0 目标）。
+原因：用户的第三方工具包（立秋那套，配 readkey.txt）在 00:56-01:01 把 UE4SS 整个换掉：
+  删掉 UE4SS.dll + 整个 Mods\ 目录，换成 dwmapi.dll(新) + x3daudio1_7.dll + ue4ss\UE4SSL.dll。
+实证（build\ue4ss_probe.py）：UE4SSL.dll 里没有 LuaMadeSimple/lua_pcall/mods.txt/Scripts，
+  3870 个导出里没有一个含 lua；它只跑原生 main.dll mod + JS。我们完全依赖 UE4SS 的 Lua → 必然失效。
+修复（已验证）：
+  - UE4SSL 整套已备份到 工作目录\backup_ue4ssl\
+  - 从 D:\Deepseek-Harness\install\UE4SS\解压后\ 恢复官方 v3.0.1（#d935b5b）扁平布局：
+    dwmapi.dll + UE4SS.dll + UE4SS-settings.ini(MajorVersion=4/MinorVersion=27) + Mods\
+  - 部署 Mods\FSDTrainerMod\Scripts\main.lua（= reference\FSDTrainerMod_main_v7.lua）
+    并在 Mods\mods.txt 加 "FSDTrainerMod : 1"
+  - 验证：UE4SS.log 出现 Starting Lua mod 'FSDTrainerMod'，dump 出现 执行器 v7 + 心跳
+防复发：src\dllmain.cpp 新增 DeployExecutorMod()，每次注入自动补齐执行器 mod 与 mods.txt，
+  并在缺少 UE4SS.dll 时写警告（但修不了"加载器被换成无 Lua 版"，那必须换回 UE4SS）。
+
+【2026-09-19 01:1x · ESP 快循环（引擎 v40）—— 修"框不跟怪走"】
+- 原因：ESP 原挂在 300ms 主循环且 os.time() 只有秒级精度 → 实际每秒才更新 1 次，怪一动框就掉队。
+- v40：独立 LoopAsync(150)（≈6.7Hz）；枚举目标每 3 秒一次，取坐标+投影每轮都做；
+  画框改用"头顶/脚底"两个投影点定高；格式改为 E/M <左> <上> <右> <下> <距离米>（DLL 兼容旧 3 元组）。
+- 已验证：DLL 渲染新格式（out\verify\esp_test2.png）；游戏内 [ESP自检] 正前方10米=959,594（期望 960,600）。
+- src\ui.cpp/ui.h 的 ESP 解析与画框已按新格式重写（红=敌人/青=矿物，标距离）。
+
+================== 2026-09-19 02:0x 整理/改动 ==================
+【工作目录已整理】
+- 新增 tools\ ：所有排查与小工具集中放这里
+    dumpinfo.py / dumpsig.py（崩溃 dump 解析）、peexp.py / peinfo.py（PE 导出表/头解析）、
+    crash_summary.py（读 UE 崩溃报告里的 ErrorMessage 与调用栈）、ue4ss_probe.py（比较两个 UE4SS 是否支持 Lua）、
+    extract_lua.py / partscheck.py / lint_lua.py（引擎 Lua 分块大小、语法、未定义函数检查）、
+    mk_verify_ini.py（造 verify 用的 ini）、seal_cc.py / seal_v41.py / seal_v41b.py（批量封印功能）、
+    patch_*.py（给引擎打补丁的脚本，留档）、monitor_game.ps1（长时间监控游戏进程/崩溃）
+- 删掉：build\obj\ 的中间产物（obj/cso/res/lib/pdb，可随时重编）、
+    reference\FSDConsole\dump_FSDConsole.dmp(153MB) 与 payload_from_memory.bin(30MB)（字符串提取版已保留）、
+    out\ 与 out\verify\ 里的旧截图与临时日志/bmp。整理后整目录约 70MB。
+- 保留：build\restore_ue4ss.bat（双击可把游戏目录的加载器换回支持 Lua 的 UE4SS v3.0.1）
+    backup_ue4ss\（你那个工具包的 UE4SSL 备份，想换回去可以用）
+
+【游戏目录被清空】
+用户自行删掉了游戏目录的多余文件并校验了完整性 → 现在 Win64 下只剩游戏本体，
+  我们的 UE4SS(dwmapi.dll/UE4SS.dll/Mods) 也没了。菜单/覆盖层不受影响（纯注入），
+  但"游戏内引擎"（移速/跳跃/怪物全灭/无敌复活/喷气靴等）需要 UE4SS：
+  要用这些功能就先双击 build\restore_ue4ss.bat。
+
+【本轮改动】
+- loader\FSDTrainerLoader.cpp：没开游戏时不再自动拉起 Steam，直接弹提示
+  「先打开游戏，在太空站中启动 Carlhand」（--silent 时不弹框，直接退出码 4）
+- src\ui.cpp / ui.h：输入框里按 Tab = 应用当前值 + 焦点跳到下一个输入框（并全选，直接打字替换）
+- config\FSDTrainer.ini：按用户要求封印 显示敌人 / 奔跑速度 / 镐子攻速 / 夜视 / 霸体；
+  「显示采集」改名为「矿物透视」并封印（key 仍是 esp_minerals）
+【2026-09-19 02:1x · 开箱即用（重要）】
+现在 out\Carlhand.exe 是**单文件开箱即用**：把 UE4SS v3.0.1 也内嵌进 exe（资源 103=UE4SS.dll 16.2MB、
+104=UE4SS-settings.ini），拿 exe 到任何干净游戏目录都能直接用。
+流程（全部自动，用户只需"开游戏→进太空站→双击 exe"）：
+  1. loader 发现游戏目录缺 UE4SS.dll / UE4SS-settings.ini → 从内嵌资源释放（已存在则不覆盖，避免动别人的）
+  2. loader 释放 FSDTrainer.ini（功能表）→ 注入 FSDTrainer.dll
+  3. DLL 部署 Mods\FSDTrainerMod（Lua 执行器）+ Mods\CheatManagerEnablerMod（作弊命令需要它）+ mods.txt 条目
+  4. DLL 直接 LoadLibrary(游戏目录\UE4SS.dll) —— **当前这局就生效，不用重启游戏**
+  5. 执行器读 FSDTrainer_cmd.txt → 加载 FSDTrainer_code.lua（功能引擎 v41）
+实测（游戏目录被彻底清空、只剩游戏本体的情况下）：UE4SS.log 出现
+  Starting Lua mod 'CheatManagerEnablerMod' / 'FSDTrainerMod'，dump 出现「>> 功能引擎 v41 已载入」，
+  移速/状态行/心跳全部正常 → 开箱即用成立。
+注意：没做 dwmapi.dll 代理（避免和别的工具抢 dwmapi），所以 UE4SS 由我们的 DLL 每次注入时加载。
+
+【2026-09-19 02:1x · 新增 作弊功能表.md】
+把游戏内 FSDCheatManager 的 266 条命令按 12 类整理成表，标注 ✅已实现 / ⭐建议做 / ⚠️慎用 / ❌不建议，
+并给出建议的落地顺序（哪些命令直发就能变成功能）。
+【2026-09-19 02:2x · 修「点击恢复默认没效果」（引擎 v42）】
+现象：把移速调高后点「恢复默认」，速度降不回来（依旧很快）。
+根因（游戏内引擎 applySpeed）：原来只要"当前 MaxWalkSpeed > 目标"就当成"玩家正在冲刺"直接 return，
+  只在 sprintBase 有值时才写回，倍率调回 1 时根本不会把 3000 降回 300。
+修法（v42）：记住"上一次我们写进去的值"(lastWrote)：
+  ① 当前值 ≈ lastWrote → 说明是我们写的，直接按新目标改写；
+  ② 倍率都已回到默认、但速度 > 走路基准×2.6（游戏正常冲刺≈2×走路=600，不会误伤）→ 判定为残留加速，强制回落 300。
+  换图/重生时清空这些记忆（lastWrote/walkBase/sprintBase 重新采集）。
+实测（游戏内，v42）：
+  移速设为 10 → [移速] 按新值改写=3000.00（读回=3000.0）
+  恢复默认(1) → [移速] 按新值改写=300.00（读回=300.0）  ← 降回来了
+其它功能：跳跃高度/无限跳跃是"不一致才写"，恢复默认会写回默认值；
+  奔跑（游戏自带 SetFastMovement）、镐子（SetQuadPickAxe）、夜视（灯组件还原）在关闭/恢复默认时都会执行还原动作。
+【2026-09-19 02:3x · 常规页新增功能 + 排版美化 + 解封（引擎 v43 / ini_ver=44）】
+1) 常规页新增 6 项（都走 CheatManager 命令，实测 ok=true）：
+   - 设置血量（value，填>0 → Cheat_SetHealth <值>）
+   - 立刻补给（action → C_Resupply）
+   - 自杀（action → C_KillPlayer）
+   - 杀某个队友（value，编号 → C_KillPlayer <编号>；**默认 0=关**，避免注入即误杀）
+   - 杀全队（action → C_KillTeam）
+   - 醉酒-玩家编号 / 醉酒-数值（0 编号 → C_Intoxication_SetAll <值>；1~4 → C_Intoxication_Set <编号> <值>）
+   注：原来"特殊功能"里的 set_health 节已挪到常规页并改名"设置血量"（避免 key 重复）。
+2) 排版美化（PageGame）：数值区加了标题/列头（功能|单位|数值|操作|状态）、隔行底色 + 鼠标悬停高亮、
+   状态列显示"默认/● 生效中/未绑定"、"恢复默认"在已是默认值时会灰掉；
+   开关与动作分成两组、按钮等宽排布（不再参差）；菜单高度上限从 720 提到 940（你 1200 高的屏能全显示）。
+3) 解封并按表完善：奔跑速度（SetFastMovement + IsFastMovementActive 校验）、镐子攻速（SetQuadPickAxe）、
+   飞行模式（cm:SetFlyMode() + IsFlyModeActive 校验，关不回去也能用 C_SetFlyMode 兜底）。
+4) 升级机制：ini 里加 ini_ver=44，loader 发现游戏目录配置版本不符就备份并重新部署功能表
+   （旧的会存成 FSDTrainer.ini.bak）——这样给别人的 exe 升级后功能表也能自动更新。
+实测日志：命令[C_Resupply]/[Cheat_SetHealth 5000]/[C_KillPlayer 2]/[C_Intoxication_Set 1 50]/[C_KillTeam]
+  全部 ok=true；[镐子] 已开启 SetQuadPickAxe；引擎 v43 载入正常。
+【2026-09-19 02:4x · 常规页排版/输入交互再修】
+1) 列头被挤压：列头单独占一行并留足行高，下面加一条细分隔线（功能|单位|数值|操作|状态）。
+2) 输入框不再"改完即刻生效"：左边 ± 按钮现在只改输入框里的数值，
+   必须点「应用」/ 回车 / Tab 才真正下发（标题旁已写明规则）。
+3) Tab 跳转：自动跳过被封印/未实现的输入框；到最后一个再按 Tab 会回到第一个（底部有提示）。
+   实现：PageGame 先算出本页可用输入框列表 rows，Tab 时取下一个（取模回绕）设置 pendingFocus。
+截图：out\verify\ui_v44.png（列头清晰、分割线可见）。
+【2026-09-19 10:2x · 设置页与菜单交互】
+1) 设置页删掉"缩放"控制（scale 仍由 ini 的 ui_scale 决定，只是不再给按钮）。
+2) 菜单支持**拖边框缩放**：鼠标贴到菜单任意一边/角（±7px）按住左键拖动即可，右下角最好用；
+   最小 520x320，最大不超过屏幕；拖完自动存进 ini（ui_win_w / ui_win_h），下次启动仍生效；
+   设置页有「恢复自动」。标题栏中间那条仍然只负责"移动"，避免和缩放抢。
+3) 设置页新增**界面透明度**：− / + 每档 5%，范围 30%~100%，默认 95%，另有「恢复95%」；
+   改完立刻生效并存进 ini（ui_opacity）；实现方式是在 Fill/Text 的 alpha 上乘一个全局系数。
+4) 设置页删掉全部文案说明（版本/日志/配置/热键/扫描范围/注意事项那一堆），只留
+   「显示高级功能」「界面透明度」「重新载入 ini」「菜单大小」。
+5) 「显示高级功能」后面括号里的内容删掉了（原来写的是"（扫描 / 冻结）"）。
+截图：out\verify\ui_settings.png（设置页只剩 4 组控件）、ui_v44.png（常规页）。
+【2026-09-19 10:3x · 透明度默认值 / 菜单复位键 / 页面滚动（ini_ver=45）】
+1) 透明度默认改成 100%（=完全不透明）：ini 里新增 ui_opacity=100，设置页按钮改为「恢复100%」，
+   代码默认值也改为 100。
+2) 菜单复位键：**HOME**（固定，不需要配置）。按一下 → 菜单重新居中 + 大小恢复自动 + 强制显示出来，
+   并存回 ini（ui_win_w/ui_win_h 置 0）。实现：dllmain 的热键线程里加了一段 HOME 检测 → Ui::ResetWindow()。
+3) 功能页支持上下滚动：鼠标在页面区域内滚轮即可上下滚（输入框正在编辑时滚轮仍然归输入框用）；
+   内容超出时右下角显示"滚轮上下滚动"并画一条滚动条；列头/标题固定不动，只有内容区滚动；
+   滚出视野的行不绘制也不可点；Tab 只在"当前可见"的输入框之间跳（不会跳到看不见的行）。
+   实测：640x480 的小窗口下内容被正确裁在面板内、出现滚动提示（out\verify\ui_v45.png）。
+【2026-09-19 10:4x · 背景不透明（v46）】
+1) 设置页「界面透明度」改名「背景不透明」（ini 键仍叫 ui_opacity，默认 100）。
+2) **100% 现在是真正的不透明**。原因：以前菜单主体/面板填充本身就带 alpha（235/245/210），
+   而且行条纹(130)、悬停(160)、滚动条、分割线这些"叠在上面"的填充也是半透明——
+   而 Fill 是**直接覆盖像素**（不是混合），所以这些半透明填充会把已经画好的不透明背景又"打回半透明"，
+   于是 100% 时仍能透出游戏画面。现在把所有会打洞的填充改成不透明（255），
+   再由"背景不透明"这个系数统一乘下来：
+   - 100% → 面板/条纹/按钮/滚动条全部 A=255（实测：菜单内部/标题栏/条纹/按钮 A 都是 255，菜单外 A=0）
+   - 70%  → 统一变成 A≈178（整体半透明，仍然不会再出现"条纹处特别透"的斑驳感）
+   保留 ESP 画框和鼠标指针的半透明（它们本来就该浮在游戏画面上）。
+【2026-09-19 11:0x · 奔跑/镐子/飞行 排查结论（引擎 v47）】
+一、找到"点了没反应"的根因（两条）
+  A) 之前的 `cm` 在 applySpeed/applyAim/applyFly 里其实是 nil（那几个函数在 chunk 层，看不到主循环的 local cm），
+     所以 奔跑 直接 return、镐子/飞行 只剩控制台兜底。已改成 getCM(pc) 现取。
+  B) 实测 **pc.CheatManager 是一个无效对象**（`[诊断] pc.CheatManager=userdata valid=false 类型=UObject`），
+     游戏真正的 FSDCheatManager 拿不到 → 所有 `cm:XXX()` 调用都失败。
+     另外警告：**绝不要用 FindAllOf/FindFirstOf 去试可能存在/不存在的类名，也不要做 obj["函数名"] 下标**——
+     实测这两个动作会直接把 UE4SS 的 Lua 线程打死（日志停在那一行、连执行器心跳都没了），
+     pcall 接不住（是 C++ 异常）。已在 v47 里移除，并在引擎里写了注释警示。
+二、已修好并实测生效
+  **奔跑速度**：本版本游戏的 SetFastMovement 无效，所以改成把"奔跑倍率"直接乘进速度目标
+  （有效倍率 = 移速倍率 × 奔跑倍率），走的是移速那条已验证有效的属性写入路径。
+  实测：奔跑填 3 → `[移速] 按新值改写=900.00 读回=900.0` + `状态: 走速=900.0`。
+三、还没解决（下一轮）
+  * 镐子攻速：控制台 `SetQuadPickAxe` 能发出但游戏无反应（本版本可能没实装）；cm 又拿不到。
+    下一步：改走"找镐子/采矿相关属性"或先用 StaticFindObject("/Script/FSD.FSDCheatManager") 拿到类再构造实例挂给 PC。
+  * 飞行模式：`C_SetFlyMode` 同样无反应；属性路线（MovementMode=5 + bCheatFlying）历史上会顿卡/闪退，要小步试。
+  * 呼叫补给仓：`InstantDropResuppyPod` 控制台调用报 ok=false（游戏不认这条命令），
+    现在功能名已改成「呼叫补给仓」，命令还会同时发 C_Resupply（补弹药是已验证有效的）。
+    下一步：改成"用 Kismet 的 SpawnActor 直接生成补给仓 Actor"（需要先拿到补给仓的类名）。
+四、引擎 Lua 已拆成 6 块（原来第 1 块已经 15.7KB，接近 MSVC 16KB 上限）。
+【2026-09-19 11:1x · dump 实读结论 + v48（奔跑只影响冲刺 / 回归善良人格）】
+一、dump 实读（用户在一次 LVL_Procedural 任务里测的）：
+  1) **进了任务以后 pc.CheatManager 才变成可用**：太空站里 [诊断] 显示 valid=false、cm:XXX 全调不了；
+     任务里出现 `[奔跑] 已关闭游戏自带快速移动（cm:SetFastMovement），读回 IsFastMovementActive=false`
+     —— 说明 cm 那条路在任务里是通的（IsFastMovementActive 读回正常）。
+     结论：需要 CheatManager 的功能，最好"进任务后"再做，并每次现取、不要缓存无效对象。
+  2) `命令[C_KillPlayer 4] ok=true` 紧接着 `命令[C_Revive] ok=true`
+     → **C_KillPlayer 的编号参数不被识别，杀的是自己**（所以要杀指定队友得换实现）。
+  3) `[镐子] ... 状态: bQuadPickAxe=UObject:...` —— 五个候选属性名全都"读到了值"且都是 UObject，
+     说明 **gp(GetPropertyValue) 对不存在的属性也会返回对象**，不能用来判断属性是否存在（老坑复现）。
+  4) 用户最后按了 END 卸载（10:53:46 全部挂钩已解除），之后 dump 就没有新行了 —— 可能是卸载后
+     UE4SS 的 Lua 线程也停了（待确认；重注入后会恢复）。
+二、v48 改动
+  1) **奔跑速度只影响冲刺**：走路目标恢复成 base×移速倍率（实测 sprint=3 时 `走速=300.0` 不再被拉高）；
+     另开一条 **60ms 冲刺小循环**：检测到游戏把速度推到冲刺档(>走路×1.25)时，写回 冲刺值×奔跑倍率。
+     （游戏可能每帧重写 MaxWalkSpeed，所以用更快的小循环去抢；走路时完全不碰。）
+  2) 「全部关闭（恢复）」改名 **「回归善良人格」**。
+  3) 点「回归善良人格」后**输入框也跟着复位**：FeatureTable::AllOff 里对 cheat 型把 cur 恢复成 def，
+     UI 侧同时 valBuf.clear()，输入框下一帧就按默认值重填（以前只关开关、数值留着）。
+三、新增 功能对照表.md（93 项 Carlhand 功能 × 266 条游戏命令）
+  - 已接上且有效约 35 项；游戏有命令、我们还没做的约 45 项（多数直发即可）；游戏没有命令的靠属性/自己实现。
